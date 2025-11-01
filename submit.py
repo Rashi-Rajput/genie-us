@@ -1,661 +1,837 @@
 #!/usr/bin/env python3
 """
-Google Classroom Automation CLI
-- Lists classes (courses) and assignments
-- Fetches assignment PDF, extracts text
-- Uses OpenAI to generate Java solutions per question
-- Compiles and runs Java; captures outputs
-- Builds a PDF solution doc with title page
-- Uploads to Drive, attaches to Classroom submission, and turns in
+Google Classroom Assignment Auto-Solver
+========================================
 
-Author: You
+This CLI tool automatically:
+1. Detects new coding assignments in Google Classroom
+2. Analyzes assignment questions (Java/Python/C++)
+3. Generates solutions with code and output screenshots
+4. Creates a formatted PDF with all solutions
+5. Uploads and submits the PDF to Google Classroom
+
+Setup:
+-------
+1. Enable Google Classroom & Drive APIs in Google Cloud Console.
+2. Download OAuth credentials.json.
+3. Install dependencies:
+   pip install google-auth google-auth-oauthlib google-api-python-client 
+   pip install google-generativeai python-dotenv typer rich
+   pip install reportlab Pillow matplotlib
+4. Create a .env file with:
+   GEMINI_API_KEY=your_api_key_here
+5. Run:
+   python assignment_solver.py detect --all-courses
 """
 
-import argparse
 import os
-import sys
+import pickle
 import re
-import io
-import json
-import time
-import shutil
-import logging
-import tempfile
 import subprocess
-from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Tuple
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+import typer
+from rich import print
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
-# Google APIs
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaFileUpload
 
-# PDF text extraction
-from pdfminer.high_level import extract_text
+import google.generativeai as genai
+from dotenv import load_dotenv
 
-# OCR fallback (optional)
-try:
-    import pytesseract
-    from pdf2image import convert_from_path
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
-
-# PDF generation
-from reportlab.lib.pagesizes import LETTER
+# PDF Generation
+from reportlab.lib.pagesizes import letter, A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak
+from reportlab.platypus import Table, TableStyle, Preformatted
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Preformatted
 
-# OpenAI for code generation
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except Exception:
-    OPENAI_AVAILABLE = False
+# Image processing
+from PIL import Image as PILImage
+import io
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+# ---------------------- Setup ----------------------
+app = typer.Typer(help="Auto-solve and submit coding assignments from Google Classroom.")
+console = Console()
+load_dotenv()
 
-# Google API scopes
 SCOPES = [
-    "https://www.googleapis.com/auth/classroom.courses.readonly",
-    "https://www.googleapis.com/auth/classroom.coursework.me",
-    "https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly",
-    "https://www.googleapis.com/auth/classroom.student-submissions.me",
-    "https://www.googleapis.com/auth/classroom.student-submissions.me.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/drive.file"
+    'https://www.googleapis.com/auth/classroom.courses.readonly',
+    'https://www.googleapis.com/auth/classroom.coursework.me',
+    'https://www.googleapis.com/auth/classroom.coursework.students',
+    'https://www.googleapis.com/auth/drive.file'
 ]
 
-DEFAULT_STUDENT_NAME = "Rashi"
-
-@dataclass
-class QuestionSolution:
-    index: int
-    question_text: str
-    class_name: str
-    java_code: str
-    run_args: List[str] = field(default_factory=list)
-    output: str = ""
-    compile_ok: bool = False
-    run_ok: bool = False
-    compile_err: str = ""
-    run_err: str = ""
+CODING_LANGUAGES = ['python', 'java', 'c++', 'cpp', 'c', 'javascript', 'js']
+ASSIGNMENT_KEYWORDS = ['assignment', 'homework', 'coding', 'program', 'exercise', 'problem', 'question']
 
 
-def get_credentials() -> Credentials:
-    creds = None
-    token_path = "token.json"
-    client_secret_path = os.environ.get("GOOGLE_CLIENT_SECRET", "client_secret.json")
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                from google.auth.transport.requests import Request
+# ---------------------- Core Class ----------------------
+class AssignmentSolver:
+    def __init__(self, credentials_file='credentials.json', token_file='token.pickle'):
+        self.credentials_file = credentials_file
+        self.token_file = token_file
+        self.service = None
+        self.drive_service = None
+        self.gemini_model = None
+        self.creds = None
+        self._authenticate()
+        self._setup_gemini()
+
+    def _authenticate(self):
+        """Authenticate with Google Classroom and Drive APIs."""
+        creds = None
+        if os.path.exists(self.token_file):
+            with open(self.token_file, 'rb') as token:
+                creds = pickle.load(token)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                console.print("[yellow]Refreshing expired credentials...[/yellow]")
                 creds.refresh(Request())
-            except Exception:
-                creds = None
-        if not creds:
-            if not os.path.exists(client_secret_path):
-                raise FileNotFoundError("Missing OAuth client secrets at client_secret.json. "
-                                        "Download from Google Cloud Console and save as client_secret.json")
-            flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w") as token:
-            token.write(creds.to_json())
-    return creds
+            else:
+                if not os.path.exists(self.credentials_file):
+                    raise FileNotFoundError(
+                        f"Credentials file '{self.credentials_file}' not found."
+                    )
+                console.print("[cyan]Authenticating with Google Classroom...[/cyan]")
+                flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, SCOPES)
+                creds = flow.run_local_server(port=0)
 
+            with open(self.token_file, 'wb') as token:
+                pickle.dump(creds, token)
+            console.print("[green]✓ Authentication successful![/green]")
 
-def classroom_service(creds: Credentials):
-    return build("classroom", "v1", credentials=creds)
+        self.creds = creds
+        self.service = build('classroom', 'v1', credentials=creds)
+        self.drive_service = build('drive', 'v3', credentials=creds)
 
+    def _setup_gemini(self):
+        """Setup Gemini AI."""
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            raise ValueError("Missing GEMINI_API_KEY in environment variables.")
+        genai.configure(api_key=api_key)
+        self.gemini_model = genai.GenerativeModel('models/gemini-2.0-flash-exp')
+        console.print("[green]✓ Gemini AI configured![/green]")
 
-def drive_service(creds: Credentials):
-    return build("drive", "v3", credentials=creds)
+    def get_courses(self):
+        """Fetch available Google Classroom courses."""
+        try:
+            results = self.service.courses().list(pageSize=100).execute()
+            return results.get('courses', [])
+        except HttpError as e:
+            console.print(f"[red]⚠️ Error fetching courses:[/red] {e}")
+            return []
 
+    def get_coursework(self, course_id, since_hours=None):
+        """Retrieve course assignments/coursework."""
+        try:
+            coursework_list = []
+            page_token = None
+            
+            while True:
+                response = self.service.courses().courseWork().list(
+                    courseId=course_id,
+                    pageSize=100,
+                    pageToken=page_token,
+                    orderBy='updateTime desc'
+                ).execute()
 
-def list_courses_cmd(args):
-    creds = get_credentials()
-    service = classroom_service(creds)
-    courses = []
-    page_token = None
-    while True:
-        resp = service.courses().list(pageSize=100, pageToken=page_token).execute()
-        courses.extend(resp.get("courses", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+                items = response.get('courseWork', [])
+                
+                if since_hours:
+                    cutoff = datetime.now() - timedelta(hours=since_hours)
+                    items = [i for i in items if self._parse_timestamp(i.get('updateTime')) > cutoff]
 
-    if not courses:
-        print("No classes found.")
-        return
+                coursework_list.extend(items)
+                page_token = response.get('nextPageToken')
+                if not page_token:
+                    break
 
-    print("Classes (Courses):")
-    print("-" * 80)
-    for c in courses:
-        cid = c.get("id")
-        name = c.get("name")
-        section = c.get("section", "")
-        state = c.get("courseState", "")
-        print(f"ID: {cid} | Name: {name} | Section: {section} | State: {state}")
+            return coursework_list
+        except HttpError as e:
+            console.print(f"[red]⚠️ Error fetching coursework:[/red] {e}")
+            return []
 
+    def _parse_timestamp(self, ts: str):
+        if not ts:
+            return datetime.min
+        ts = ts.replace('Z', '+00:00')
+        try:
+            return datetime.fromisoformat(ts.replace('+00:00', ''))
+        except Exception:
+            return datetime.min
 
-def list_assignments_cmd(args):
-    creds = get_credentials()
-    service = classroom_service(creds)
-    course_id = args.course_id
-    try:
-        course = service.courses().get(id=course_id).execute()
-        print(f"Class: {course.get('name')} (ID: {course_id})")
-    except HttpError as e:
-        logging.error(f"Error fetching course: {e}")
-        sys.exit(1)
+    def detect_coding_assignments(self, coursework_list: List[Dict]) -> List[Dict]:
+        """Detect assignments that appear to be coding-related."""
+        coding_assignments = []
+        
+        for work in coursework_list:
+            title = work.get('title', '').lower()
+            description = work.get('description', '').lower()
+            combined_text = f"{title} {description}"
+            
+            # Check for coding keywords
+            has_coding_keyword = any(keyword in combined_text for keyword in ASSIGNMENT_KEYWORDS)
+            has_language = any(lang in combined_text for lang in CODING_LANGUAGES)
+            
+            if has_coding_keyword or has_language:
+                coding_assignments.append(work)
+        
+        return coding_assignments
 
-    cw_service = service.courses().courseWork()
-    courseworks = []
-    page_token = None
-    while True:
-        resp = cw_service.list(courseId=course_id, pageSize=100, pageToken=page_token).execute()
-        courseworks.extend(resp.get("courseWork", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+    def check_submission_status(self, course_id: str, coursework_id: str) -> Tuple[bool, Optional[str]]:
+        """Check if assignment has already been submitted."""
+        try:
+            submissions = self.service.courses().courseWork().studentSubmissions().list(
+                courseId=course_id,
+                courseWorkId=coursework_id,
+                userId='me'
+            ).execute()
+            
+            student_submissions = submissions.get('studentSubmissions', [])
+            if student_submissions:
+                submission = student_submissions[0]
+                state = submission.get('state', '')
+                submission_id = submission.get('id', '')
+                
+                # States: NEW, CREATED, TURNED_IN, RETURNED, RECLAIMED_BY_STUDENT
+                is_submitted = state in ['TURNED_IN', 'RETURNED']
+                return is_submitted, submission_id
+            
+            return False, None
+        except HttpError as e:
+            console.print(f"[red]⚠️ Error checking submission:[/red] {e}")
+            return False, None
 
-    if not courseworks:
-        print("No assignments found for this class.")
-        return
+    def extract_questions(self, assignment_text: str) -> Dict:
+        """Use Gemini to extract and analyze coding questions from assignment."""
+        prompt = f"""
+You are analyzing a coding assignment. Extract all coding questions/problems from the following assignment text.
 
-    print("Assignments:")
-    print("-" * 80)
-    for cw in courseworks:
-        cid = cw.get("id")
-        title = cw.get("title")
-        state = cw.get("state", "")
-        due = cw.get("dueDate", {})
-        due_time = cw.get("dueTime", {})
-        due_str = ""
-        if due:
-            due_str = f"{due.get('year','')}-{str(due.get('month','')).zfill(2)}-{str(due.get('day','')).zfill(2)}"
-            if due_time:
-                due_str += f" {str(due_time.get('hours','0')).zfill(2)}:{str(due_time.get('minutes','0')).zfill(2)}"
-        print(f"ID: {cid} | Title: {title} | State: {state} | Due: {due_str}")
-        # Show materials briefly
-        mats = cw.get("materials", [])
-        if mats:
-            mat_summ = []
-            for m in mats:
-                if "driveFile" in m:
-                    mat_summ.append(f"DriveFile: {m['driveFile']['driveFile'].get('title','(no title)')}")
-                elif "link" in m:
-                    mat_summ.append(f"Link: {m['link'].get('title','')}")
-                elif "youtubeVideo" in m:
-                    mat_summ.append("YouTube")
-            if mat_summ:
-                print("  Materials:", "; ".join(mat_summ))
+Assignment Text:
+{assignment_text}
 
+Please analyze and provide:
+1. Identify the programming language required (Python, Java, C++, or multiple)
+2. Extract each coding question/problem separately
+3. For each question, identify:
+   - Question number
+   - Problem statement
+   - Input/output requirements
+   - Any constraints or special conditions
+   - Expected functionality
 
-def download_assignment_pdfs(service_classroom, service_drive, course_id: str, coursework_id: str, dest_dir: str) -> List[str]:
-    """Download PDF materials for the coursework. Returns list of local file paths."""
-    cw = service_classroom.courses().courseWork().get(courseId=course_id, id=coursework_id).execute()
-    materials = cw.get("materials", [])
-    pdf_paths = []
-    os.makedirs(dest_dir, exist_ok=True)
-    for m in materials:
-        if "driveFile" in m:
-            df = m["driveFile"]["driveFile"]
-            file_id = df["id"]
-            # Inspect mimeType
-            meta = service_drive.files().get(fileId=file_id, fields="id,name,mimeType").execute()
-            name = meta["name"]
-            mime = meta.get("mimeType")
-            if mime == "application/pdf" or name.lower().endswith(".pdf"):
-                out_path = os.path.join(dest_dir, name)
-                request = service_drive.files().get_media(fileId=file_id)
-                fh = io.FileIO(out_path, "wb")
-                downloader = MediaIoBaseDownload(fh, request)
-                done = False
-                while not done:
-                    status, done = downloader.next_chunk()
-                fh.close()
-                logging.info(f"Downloaded: {out_path}")
-                pdf_paths.append(out_path)
-    return pdf_paths
+Format your response as JSON:
+{{
+  "language": "python/java/c++",
+  "total_questions": number,
+  "questions": [
+    {{
+      "number": 1,
+      "title": "Brief title",
+      "problem": "Full problem statement",
+      "requirements": "Key requirements",
+      "input_output": "Input/output specifications"
+    }}
+  ]
+}}
 
+Be thorough and extract all questions. If no clear coding questions are found, indicate that.
+"""
+        
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            text = response.text.strip()
+            
+            # Extract JSON from markdown code blocks if present
+            json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', text, re.DOTALL)
+            if json_match:
+                text = json_match.group(1)
+            
+            import json
+            return json.loads(text)
+        except Exception as e:
+            console.print(f"[red]Error extracting questions:[/red] {e}")
+            return {"language": "unknown", "total_questions": 0, "questions": []}
 
-def extract_text_from_pdf(pdf_path: str) -> str:
-    try:
-        text = extract_text(pdf_path)
-        if text and len(text.strip()) >= 50:
-            return text
-    except Exception as e:
-        logging.warning(f"pdfminer failed, trying OCR if available. Error: {e}")
+    def generate_solution(self, question: Dict, language: str) -> Dict:
+        """Generate solution code for a specific question."""
+        prompt = f"""
+You are an expert programmer. Generate a complete, working solution for the following coding problem.
 
-    if not OCR_AVAILABLE:
-        logging.warning("OCR not available; install pytesseract and pdf2image for scanned PDFs.")
-        return ""
+Programming Language: {language}
+Question Number: {question.get('number', 1)}
+Problem: {question.get('problem', '')}
+Requirements: {question.get('requirements', '')}
+Input/Output: {question.get('input_output', '')}
 
-    # OCR fallback
-    try:
-        images = convert_from_path(pdf_path, dpi=300)
-        ocr_texts = []
-        for img in images:
-            ocr_texts.append(pytesseract.image_to_string(img))
-        return "\n".join(ocr_texts)
-    except Exception as e:
-        logging.error(f"OCR failed: {e}")
-        return ""
+Provide:
+1. Complete, executable code with proper comments
+2. Example test cases with expected outputs
+3. Explanation of the approach
 
+Format your response as JSON:
+{{
+  "code": "Complete code here",
+  "explanation": "Brief explanation of the approach",
+  "test_cases": [
+    {{"input": "test input", "output": "expected output"}}
+  ]
+}}
 
-def sanitize_class_name(name: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9_]", "_", name)
-    if not re.match(r"[A-Za-z_]", name):
-        name = f"Q_{name}"
-    return name
+Make sure the code is:
+- Syntactically correct
+- Well-commented
+- Follows best practices
+- Handles edge cases
+- Includes sample input/output in the code if applicable
+"""
+        
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            text = response.text.strip()
+            
+            # Extract JSON from markdown code blocks
+            json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', text, re.DOTALL)
+            if json_match:
+                text = json_match.group(1)
+            
+            import json
+            solution = json.loads(text)
+            
+            # Clean code from markdown if present
+            code = solution.get('code', '')
+            code_match = re.search(r'```(?:\w+)?\s*(.*?)\s*```', code, re.DOTALL)
+            if code_match:
+                solution['code'] = code_match.group(1).strip()
+            
+            return solution
+        except Exception as e:
+            console.print(f"[red]Error generating solution:[/red] {e}")
+            return {"code": f"// Error generating solution: {e}", "explanation": "", "test_cases": []}
 
+    def execute_code_and_capture(self, code: str, language: str, test_cases: List[Dict]) -> Tuple[str, bytes]:
+        """Execute code and capture output as screenshot."""
+        output_text = ""
+        
+        try:
+            # Create temp file with appropriate extension
+            ext_map = {'python': '.py', 'java': '.java', 'c++': '.cpp', 'cpp': '.cpp', 'c': '.c'}
+            ext = ext_map.get(language.lower(), '.txt')
+            
+            with tempfile.NamedTemporaryFile(mode='w', suffix=ext, delete=False) as f:
+                f.write(code)
+                temp_file = f.name
+            
+            # Execute based on language
+            if language.lower() == 'python':
+                result = subprocess.run(
+                    ['python3', temp_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                output_text = result.stdout + result.stderr
+                
+            elif language.lower() == 'java':
+                # Compile
+                compile_result = subprocess.run(
+                    ['javac', temp_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if compile_result.returncode == 0:
+                    # Run
+                    class_name = Path(temp_file).stem
+                    result = subprocess.run(
+                        ['java', '-cp', str(Path(temp_file).parent), class_name],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    output_text = result.stdout + result.stderr
+                else:
+                    output_text = f"Compilation Error:\n{compile_result.stderr}"
+                    
+            elif language.lower() in ['c++', 'cpp']:
+                # Compile
+                exe_file = temp_file.replace('.cpp', '.out')
+                compile_result = subprocess.run(
+                    ['g++', temp_file, '-o', exe_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if compile_result.returncode == 0:
+                    # Run
+                    result = subprocess.run(
+                        [exe_file],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    output_text = result.stdout + result.stderr
+                else:
+                    output_text = f"Compilation Error:\n{compile_result.stderr}"
+            
+            # Clean up
+            os.unlink(temp_file)
+            if language.lower() in ['c++', 'cpp'] and os.path.exists(exe_file):
+                os.unlink(exe_file)
+                
+        except subprocess.TimeoutExpired:
+            output_text = "Execution timeout (>5 seconds)"
+        except Exception as e:
+            output_text = f"Execution error: {str(e)}"
+        
+        # Create screenshot of output using matplotlib
+        screenshot_bytes = self._create_output_screenshot(output_text, language)
+        
+        return output_text, screenshot_bytes
 
-def check_java_installed() -> Tuple[bool, str]:
-    try:
-        out = subprocess.run(["javac", "-version"], capture_output=True, text=True)
-        if out.returncode == 0 or out.stderr.startswith("javac"):
-            # Java prints version to stderr often
-            ver_line = out.stderr.strip() or out.stdout.strip()
-            return True, ver_line
-        return False, out.stderr or out.stdout
-    except FileNotFoundError:
-        return False, "javac not found on PATH"
+    def _create_output_screenshot(self, output_text: str, language: str) -> bytes:
+        """Create a visual screenshot of the output."""
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.axis('off')
+        
+        # Create a terminal-like background
+        rect = patches.Rectangle((0, 0), 1, 1, linewidth=2, 
+                                 edgecolor='#333', facecolor='#1e1e1e')
+        ax.add_patch(rect)
+        
+        # Add output text
+        wrapped_text = output_text[:1000]  # Limit output length
+        ax.text(0.05, 0.95, f"{language.upper()} Output:\n\n{wrapped_text}",
+               verticalalignment='top', horizontalalignment='left',
+               fontfamily='monospace', fontsize=10, color='#00ff00',
+               bbox=dict(boxstyle='round', facecolor='#1e1e1e', alpha=0.8))
+        
+        # Save to bytes
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        plt.close()
+        buf.seek(0)
+        
+        return buf.read()
 
-
-def compile_and_run_java(class_name: str, java_code: str, work_dir: str, run_args: Optional[List[str]] = None) -> Tuple[bool, bool, str, str]:
-    """Compile and run a Java class. Returns (compile_ok, run_ok, stdout, stderr)."""
-    run_args = run_args or []
-    java_file = os.path.join(work_dir, f"{class_name}.java")
-    with open(java_file, "w", encoding="utf-8") as f:
-        f.write(java_code)
-
-    # Compile
-    comp = subprocess.run(["javac", "-encoding", "UTF-8", java_file], capture_output=True, text=True, cwd=work_dir)
-    if comp.returncode != 0:
-        return False, False, "", comp.stderr
-
-    # Run
-    run = subprocess.run(["java", class_name] + run_args, capture_output=True, text=True, cwd=work_dir, timeout=20)
-    run_ok = (run.returncode == 0)
-    return True, run_ok, run.stdout, run.stderr
-
-
-def build_solution_pdf(output_path: str, course_name: str, assignment_name: str, student_name: str, solutions: List[QuestionSolution]):
-    # Prepare document
-    doc = SimpleDocTemplate(output_path, pagesize=LETTER, rightMargin=54, leftMargin=54, topMargin=54, bottomMargin=54)
-    styles = getSampleStyleSheet()
-    style_title = styles["Title"]
-    style_h1 = styles["Heading1"]
-    style_h2 = styles["Heading2"]
-    style_body = styles["BodyText"]
-    style_mono = ParagraphStyle(
-        name="Monospace",
-        parent=styles["Code"],
-        fontName="Courier",
-        fontSize=9,
-        leading=12,
-    )
-
-    story = []
-
-    # Title page
-    story.append(Spacer(1, 2 * inch))
-    story.append(Paragraph(assignment_name, style_title))
-    story.append(Spacer(1, 0.3 * inch))
-    story.append(Paragraph(f"Course: {course_name}", style_h2))
-    story.append(Paragraph(f"Student: {student_name}", style_h2))
-    story.append(Spacer(1, 4 * inch))
-    story.append(Paragraph("Generated by Google Classroom CLI", style_body))
-    story.append(PageBreak())
-
-    # Questions
-    for sol in solutions:
-        story.append(Paragraph(f"Q{sol.index}. Original Question Text", style_h1))
-        story.append(Spacer(1, 0.1 * inch))
-        story.append(Paragraph(escape_html(sol.question_text).replace("\n", "<br/>"), style_body))
-        story.append(Spacer(1, 0.2 * inch))
-
-        story.append(Paragraph("✅ Java Code Solution (fully working)", style_h2))
-        story.append(Spacer(1, 0.1 * inch))
-        story.append(Preformatted(sol.java_code, style_mono))
-        story.append(Spacer(1, 0.2 * inch))
-
-        story.append(Paragraph("📸 Output Screenshot / Output Block", style_h2))
-        story.append(Spacer(1, 0.1 * inch))
-        output_block = sol.output if (sol.compile_ok and sol.run_ok) else (
-            "Compilation or execution failed.\n"
-            f"Compile OK: {sol.compile_ok}\n"
-            f"Run OK: {sol.run_ok}\n"
-            f"Compile Errors:\n{sol.compile_err}\n"
-            f"Runtime Errors:\n{sol.run_err}\n"
+    def create_solution_pdf(self, assignment_name: str, questions_data: Dict, 
+                           solutions: List[Dict], output_path: str):
+        """Create a formatted PDF with all solutions."""
+        doc = SimpleDocTemplate(output_path, pagesize=letter,
+                              rightMargin=0.75*inch, leftMargin=0.75*inch,
+                              topMargin=1*inch, bottomMargin=0.75*inch)
+        
+        # Styles
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#1a237e'),
+            spaceAfter=30,
+            alignment=TA_CENTER
         )
-        story.append(Preformatted(output_block, style_mono))
-        story.append(PageBreak())
-
-    doc.build(story)
-    logging.info(f"Solution PDF created: {output_path}")
-
-
-def escape_html(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def sanitize_filename(name: str) -> str:
-    name = re.sub(r"[^\w\-. ]", "_", name)
-    name = name.strip().replace(" ", "_")
-    return name[:120]
-
-
-def upload_to_drive(drive, file_path: str, mime_type: str = "application/pdf") -> Dict[str, Any]:
-    file_metadata = {
-        "name": os.path.basename(file_path),
-        "mimeType": mime_type,
-    }
-    media = MediaFileUpload(file_path, mimetype=mime_type, resumable=True)
-    f = drive.files().create(body=file_metadata, media_body=media, fields="id,webViewLink").execute()
-    logging.info(f"Uploaded to Drive: {f['id']}")
-    return f
-
-
-def get_my_submission(classroom, course_id: str, coursework_id: str) -> Optional[Dict[str, Any]]:
-    # Many API versions accept userId='me' parameter
-    try:
-        resp = classroom.courses().courseWork().studentSubmissions().list(
-            courseId=course_id, courseWorkId=coursework_id, pageSize=10, userId="me"
-        ).execute()
-    except TypeError:
-        # Fallback if userId not supported: fetch and find first with "userId" equal to me (not trivial without profile)
-        resp = classroom.courses().courseWork().studentSubmissions().list(
-            courseId=course_id, courseWorkId=coursework_id, pageSize=100
-        ).execute()
-    subs = resp.get("studentSubmissions", [])
-    if not subs:
-        return None
-    # Return the first submission for this user
-    # Some courses allow multiple submissions; take the first in "state" NEW|CREATED|RECLAIMED_BY_STUDENT
-    for s in subs:
-        if s.get("state") in ("CREATED", "NEW", "RECLAIMED_BY_STUDENT", "RETURNED"):
-            return s
-    return subs[0]
-
-
-def attach_and_turn_in(classroom, course_id: str, coursework_id: str, submission_id: str, drive_file_id: str):
-    # Attach drive file
-    try:
-        req_body = {
-            "addAttachments": [
-                {"driveFile": {"id": drive_file_id}}
-            ]
-        }
-        classroom.courses().courseWork().studentSubmissions().modifyAttachments(
-            courseId=course_id, courseWorkId=coursework_id, id=submission_id, body=req_body
-        ).execute()
-        logging.info("Attached PDF to submission.")
-    except HttpError as e:
-        logging.error(f"Failed to attach file: {e}")
-
-    # Turn in (if not already turned in)
-    try:
-        classroom.courses().courseWork().studentSubmissions().turnIn(
-            courseId=course_id, courseWorkId=coursework_id, id=submission_id, body={}
-        ).execute()
-        logging.info("Submission turned in.")
-    except HttpError as e:
-        if "already turned in" in str(e).lower():
-            logging.info("Submission already turned in.")
-        else:
-            logging.error(f"Turn in failed: {e}")
-
-
-def generate_solutions_with_openai(assignment_text: str, course_name: str, assignment_name: str, student_name: str) -> List[QuestionSolution]:
-    if not OPENAI_AVAILABLE:
-        raise RuntimeError("OpenAI library not installed. pip install openai")
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
-    client = OpenAI(api_key=api_key)
-
-    system = (
-        "You are a senior Java instructor. Extract all programming questions from the provided assignment text. "
-        "For each question:\n"
-        "- Provide the original question text (verbatim).\n"
-        "- Provide a fully working Java program with a public class and a main method.\n"
-        "- Do NOT use packages.\n"
-        "- Ensure the program does not require interactive input; if the prompt requires input, pick reasonable sample inputs embedded in code so it runs headlessly and demonstrates the solution.\n"
-        "- Use class names: Q1_Solution, Q2_Solution, etc.\n"
-        "- The code must compile with Java 17.\n"
-        "Return a strict JSON object of the form:\n"
-        "{\n"
-        '  "questions": [\n'
-        '    {\n'
-        '      "index": 1,\n'
-        '      "question_text": "<original text>",\n'
-        '      "class_name": "Q1_Solution",\n'
-        '      "java_code": "public class Q1_Solution { ... }",\n'
-        '      "run_args": []\n'
-        "    }, ...\n"
-        "  ]\n"
-        "}\n"
-    )
-
-    user = f"Course: {course_name}\nAssignment: {assignment_name}\nAssignment PDF text follows:\n---\n{assignment_text}\n---\n"
-
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
+        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=16,
+            textColor=colors.HexColor('#283593'),
+            spaceAfter=12,
+            spaceBefore=12
+        )
+        
+        code_style = ParagraphStyle(
+            'Code',
+            parent=styles['Code'],
+            fontSize=9,
+            leftIndent=20,
+            rightIndent=20,
+            spaceAfter=10
+        )
+        
+        # Build PDF content
+        story = []
+        
+        # Title Page
+        story.append(Paragraph(f"{assignment_name}", title_style))
+        story.append(Paragraph("SOLUTIONS", title_style))
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Info table
+        info_data = [
+            ['Language:', questions_data.get('language', 'N/A').upper()],
+            ['Total Questions:', str(questions_data.get('total_questions', 0))],
+            ['Generated:', datetime.now().strftime('%Y-%m-%d %H:%M')]
         ]
-    )
-
-    content = resp.choices[0].message.content
-    # Try to extract JSON if surrounded by code fences
-    json_text = content
-    fence_match = re.search(r"```json\s*(.*?)```", content, re.S)
-    if fence_match:
-        json_text = fence_match.group(1).strip()
-    else:
-        # Try any fence
-        fence_match = re.search(r"```(.*?)```", content, re.S)
-        if fence_match:
-            json_text = fence_match.group(1).strip()
-
-    data = json.loads(json_text)
-    out: List[QuestionSolution] = []
-    for q in data.get("questions", []):
-        idx = int(q.get("index", len(out) + 1))
-        class_name = sanitize_class_name(q.get("class_name", f"Q{idx}_Solution"))
-        code = q.get("java_code", "")
-        # Ensure class name matches file class
-        class_decl_match = re.search(r"public\s+class\s+([A-Za-z_]\w*)", code)
-        if class_decl_match and class_decl_match.group(1) != class_name:
-            # Rename class in code to expected class_name
-            code = re.sub(r"(public\s+class\s+)([A-Za-z_]\w*)", r"\1" + class_name, code, count=1)
-
-        out.append(QuestionSolution(
-            index=idx,
-            question_text=q.get("question_text", "").strip(),
-            class_name=class_name,
-            java_code=code.strip(),
-            run_args=q.get("run_args", []) or []
-        ))
-    return out
-
-
-def solve_and_submit_cmd(args):
-    student_name = args.student_name or DEFAULT_STUDENT_NAME
-    creds = get_credentials()
-    classroom = classroom_service(creds)
-    drive = drive_service(creds)
-
-    course_id = args.course_id
-    coursework_id = args.coursework_id
-
-    # Fetch course and assignment meta
-    course = classroom.courses().get(id=course_id).execute()
-    cw = classroom.courses().courseWork().get(courseId=course_id, id=coursework_id).execute()
-    course_name = course.get("name", f"Course_{course_id}")
-    assignment_name = cw.get("title", f"Assignment_{coursework_id}")
-
-    # Download or use provided PDF
-    tmp_dir = tempfile.mkdtemp(prefix="gc_cli_")
-    try:
-        if args.pdf:
-            pdf_paths = [args.pdf]
-        else:
-            pdf_paths = download_assignment_pdfs(classroom, drive, course_id, coursework_id, tmp_dir)
-
-        if not pdf_paths:
-            logging.error("No PDF materials found for this assignment. Provide --pdf to supply a local file.")
-            sys.exit(1)
-
-        pdf_path = pdf_paths[0]
-        logging.info(f"Processing PDF: {pdf_path}")
-
-        # Extract text
-        text = extract_text_from_pdf(pdf_path)
-        if not text or len(text.strip()) < 10:
-            logging.error("Failed to extract text from the PDF.")
-            sys.exit(1)
-
-        # Check Java
-        ok, ver = check_java_installed()
-        if not ok:
-            logging.error(f"Java compiler not available: {ver}")
-            sys.exit(1)
-        logging.info(f"Java detected: {ver}")
-
-        # Generate solutions via OpenAI
-        solutions = generate_solutions_with_openai(text, course_name, assignment_name, student_name)
-
-        # Compile & run each
-        build_dir = os.path.join(tmp_dir, "java_build")
-        os.makedirs(build_dir, exist_ok=True)
-        for sol in sorted(solutions, key=lambda s: s.index):
-            comp_ok, run_ok, out_str, err_str = compile_and_run_java(sol.class_name, sol.java_code, build_dir, sol.run_args)
-            sol.compile_ok = comp_ok
-            sol.run_ok = run_ok
-            sol.output = out_str
-            sol.compile_err = "" if comp_ok else err_str
-            sol.run_err = "" if run_ok else err_str
-            logging.info(f"Q{sol.index} compile: {comp_ok}, run: {run_ok}")
-
+        info_table = Table(info_data, colWidths=[2*inch, 4*inch])
+        info_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 11),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+        ]))
+        story.append(info_table)
+        story.append(PageBreak())
+        
+        # Solutions
+        for i, (question, solution) in enumerate(zip(questions_data['questions'], solutions)):
+            # Question header
+            story.append(Paragraph(f"Question {question['number']}: {question.get('title', 'Problem')}", 
+                                 heading_style))
+            story.append(Spacer(1, 0.1*inch))
+            
+            # Problem statement
+            story.append(Paragraph(f"<b>Problem:</b> {question.get('problem', 'N/A')}", 
+                                 styles['Normal']))
+            story.append(Spacer(1, 0.1*inch))
+            
+            # Code solution
+            story.append(Paragraph("<b>Solution Code:</b>", heading_style))
+            code_text = solution.get('code', '// No code generated')
+            # Use Preformatted for code to preserve formatting
+            code_lines = code_text.split('\n')
+            for line in code_lines[:50]:  # Limit lines to avoid overflow
+                story.append(Preformatted(line, code_style))
+            story.append(Spacer(1, 0.2*inch))
+            
+            # Output screenshot
+            if 'screenshot' in solution and solution['screenshot']:
+                story.append(Paragraph("<b>Output Screenshot:</b>", heading_style))
+                try:
+                    img = Image(io.BytesIO(solution['screenshot']), width=5*inch, height=3*inch)
+                    story.append(img)
+                except Exception as e:
+                    story.append(Paragraph(f"[Screenshot error: {e}]", styles['Normal']))
+                story.append(Spacer(1, 0.2*inch))
+            
+            # Output text
+            if 'output' in solution:
+                story.append(Paragraph("<b>Output:</b>", heading_style))
+                output_para = Paragraph(f"<font face='Courier'>{solution['output'][:500]}</font>", 
+                                      styles['Normal'])
+                story.append(output_para)
+                story.append(Spacer(1, 0.2*inch))
+            
+            # Explanation
+            if solution.get('explanation'):
+                story.append(Paragraph("<b>Explanation:</b>", heading_style))
+                story.append(Paragraph(solution['explanation'], styles['Normal']))
+            
+            if i < len(solutions) - 1:
+                story.append(PageBreak())
+        
         # Build PDF
-        pdf_name = f"Rashi_{sanitize_filename(assignment_name)}.pdf"
-        output_pdf = os.path.abspath(pdf_name)
-        build_solution_pdf(output_pdf, course_name, assignment_name, student_name, solutions)
+        doc.build(story)
+        console.print(f"[green]✓ PDF created: {output_path}[/green]")
 
-        # Upload to Drive
-        uploaded = upload_to_drive(drive, output_pdf, mime_type="application/pdf")
+    def upload_to_drive(self, file_path: str, file_name: str) -> str:
+        """Upload file to Google Drive and return file ID."""
+        try:
+            file_metadata = {'name': file_name}
+            media = MediaFileUpload(file_path, mimetype='application/pdf')
+            
+            file = self.drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+            
+            file_id = file.get('id')
+            console.print(f"[green]✓ Uploaded to Drive: {file_id}[/green]")
+            return file_id
+        except HttpError as e:
+            console.print(f"[red]⚠️ Error uploading to Drive:[/red] {e}")
+            return None
 
-        # Attach & turn in
-        submission = get_my_submission(classroom, course_id, coursework_id)
-        if not submission:
-            logging.error("Could not find your student submission for this assignment.")
-            sys.exit(1)
-
-        attach_and_turn_in(classroom, course_id, coursework_id, submission["id"], uploaded["id"])
-        print(f"Done. Submitted: {output_pdf} (Drive file ID: {uploaded['id']})")
-
-    finally:
-        if not args.keep_temp:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def process_local_pdf_cmd(args):
-    student_name = args.student_name or DEFAULT_STUDENT_NAME
-    course_name = args.course_name or "Unknown Course"
-    assignment_name = args.assignment_name or "Assignment"
-    pdf_path = args.pdf
-
-    if not os.path.exists(pdf_path):
-        logging.error(f"PDF not found: {pdf_path}")
-        sys.exit(1)
-
-    text = extract_text_from_pdf(pdf_path)
-    if not text or len(text.strip()) < 10:
-        logging.error("Failed to extract text from the PDF.")
-        sys.exit(1)
-
-    ok, ver = check_java_installed()
-    if not ok:
-        logging.error(f"Java compiler not available: {ver}")
-        sys.exit(1)
-    logging.info(f"Java detected: {ver}")
-
-    solutions = generate_solutions_with_openai(text, course_name, assignment_name, student_name)
-
-    tmp_dir = tempfile.mkdtemp(prefix="gc_cli_local_")
-    try:
-        build_dir = os.path.join(tmp_dir, "java_build")
-        os.makedirs(build_dir, exist_ok=True)
-        for sol in sorted(solutions, key=lambda s: s.index):
-            comp_ok, run_ok, out_str, err_str = compile_and_run_java(sol.class_name, sol.java_code, build_dir, sol.run_args)
-            sol.compile_ok = comp_ok
-            sol.run_ok = run_ok
-            sol.output = out_str
-            sol.compile_err = "" if comp_ok else err_str
-            sol.run_err = "" if run_ok else err_str
-
-        pdf_name = f"Rashi_{sanitize_filename(assignment_name)}.pdf"
-        output_pdf = os.path.abspath(pdf_name)
-        build_solution_pdf(output_pdf, course_name, assignment_name, student_name, solutions)
-        print(f"Built solution PDF: {output_pdf}")
-    finally:
-        if not args.keep_temp:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+    def submit_assignment(self, course_id: str, coursework_id: str, 
+                         submission_id: str, drive_file_id: str):
+        """Attach file and turn in assignment."""
+        try:
+            # Attach file
+            attachment = {
+                'driveFile': {
+                    'id': drive_file_id,
+                    'title': 'Solution PDF'
+                }
+            }
+            
+            self.service.courses().courseWork().studentSubmissions().modifyAttachments(
+                courseId=course_id,
+                courseWorkId=coursework_id,
+                id=submission_id,
+                body={'addAttachments': [attachment]}
+            ).execute()
+            
+            console.print("[green]✓ File attached to submission[/green]")
+            
+            # Turn in
+            self.service.courses().courseWork().studentSubmissions().turnIn(
+                courseId=course_id,
+                courseWorkId=coursework_id,
+                id=submission_id,
+                body={}
+            ).execute()
+            
+            console.print("[green]✓ Assignment turned in![/green]")
+            
+        except HttpError as e:
+            console.print(f"[red]⚠️ Error submitting assignment:[/red] {e}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Google Classroom Automation CLI")
-    sub = parser.add_subparsers(required=True)
+# ---------------------- Commands ----------------------
 
-    # list-courses
-    p1 = sub.add_parser("list-courses", help="List all classes and their IDs")
-    p1.set_defaults(func=list_courses_cmd)
+@app.command()
+def list_courses(
+    credentials: str = typer.Option("credentials.json", help="Path to credentials file"),
+    token: str = typer.Option("token.pickle", help="Path to saved token file"),
+):
+    """List all available Google Classroom courses."""
+    console.print("📚 [bold]Fetching your courses...[/bold]\n")
+    solver = AssignmentSolver(credentials_file=credentials, token_file=token)
+    courses = solver.get_courses()
+    if not courses:
+        console.print("No courses found.")
+        raise typer.Exit()
+    for c in courses:
+        console.print(f"• [green]{c['name']}[/green] (ID: {c['id']})")
 
-    # list-assignments
-    p2 = sub.add_parser("list-assignments", help="List assignments and IDs for a class")
-    p2.add_argument("--course-id", required=True, help="Course (class) ID")
-    p2.set_defaults(func=list_assignments_cmd)
 
-    # solve-and-submit
-    p3 = sub.add_parser("solve-and-submit", help="Fetch assignment PDF, solve, generate PDF, and submit")
-    p3.add_argument("--course-id", required=True, help="Course ID")
-    p3.add_argument("--coursework-id", required=True, help="Assignment (courseWork) ID")
-    p3.add_argument("--student-name", default=DEFAULT_STUDENT_NAME, help="Student name for title page")
-    p3.add_argument("--pdf", help="Path to local assignment PDF (override download)")
-    p3.add_argument("--keep-temp", action="store_true", help="Keep temp working directory for debugging")
-    p3.set_defaults(func=solve_and_submit_cmd)
+@app.command()
+def detect(
+    course_id: str = typer.Option(None, help="Specific course ID to monitor."),
+    all_courses: bool = typer.Option(False, "--all-courses", help="Monitor all courses."),
+    since: int = typer.Option(168, help="Check assignments from last N hours (default: 168 = 1 week)."),
+    auto_submit: bool = typer.Option(False, "--auto-submit", help="Automatically submit solutions."),
+    skip_submitted: bool = typer.Option(True, help="Skip already submitted assignments."),
+    output_dir: str = typer.Option("./solutions", help="Directory to save solution PDFs."),
+    credentials: str = typer.Option("credentials.json", help="Path to credentials file."),
+    token: str = typer.Option("token.pickle", help="Path to saved token file.")
+):
+    """
+    Detect new coding assignments, generate solutions, and optionally submit them.
+    """
+    console.print("🤖 [bold]Initializing Assignment Auto-Solver...[/bold]\n")
+    solver = AssignmentSolver(credentials_file=credentials, token_file=token)
+    
+    # Create output directory
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Determine courses
+    if course_id:
+        courses = [{'id': course_id, 'name': f'Course {course_id}'}]
+    elif all_courses:
+        courses = solver.get_courses()
+        if not courses:
+            console.print("[red]No courses found.[/red]")
+            raise typer.Exit()
+    else:
+        console.print("[yellow]❗ Please specify either --course-id or --all-courses.[/yellow]")
+        raise typer.Exit()
+    
+    total_assignments = 0
+    total_solved = 0
+    total_submitted = 0
+    
+    for course in courses:
+        console.rule(f"[bold blue]📚 {course['name']}[/bold blue]")
+        
+        # Get coursework
+        coursework = solver.get_coursework(course['id'], since_hours=since)
+        if not coursework:
+            console.print("[dim]No assignments found.[/dim]\n")
+            continue
+        
+        # Detect coding assignments
+        coding_assignments = solver.detect_coding_assignments(coursework)
+        if not coding_assignments:
+            console.print("[dim]No coding assignments detected.[/dim]\n")
+            continue
+        
+        console.print(f"🎯 Found [green]{len(coding_assignments)}[/green] coding assignment(s)\n")
+        total_assignments += len(coding_assignments)
+        
+        for assignment in coding_assignments:
+            assignment_id = assignment['id']
+            assignment_title = assignment.get('title', 'Untitled Assignment')
+            description = assignment.get('description', '')
+            
+            console.print(Panel(
+                f"[bold]Title:[/bold] {assignment_title}\n"
+                f"[bold]ID:[/bold] {assignment_id}\n"
+                f"[bold]Updated:[/bold] {assignment.get('updateTime', 'N/A')}",
+                title="[cyan]📝 Assignment Detected[/cyan]",
+                border_style="cyan"
+            ))
+            
+            # Check submission status
+            is_submitted, submission_id = solver.check_submission_status(course['id'], assignment_id)
+            
+            if is_submitted and skip_submitted:
+                console.print("[yellow]⏭️  Already submitted, skipping...[/yellow]\n")
+                continue
+            
+            if not submission_id:
+                console.print("[yellow]⚠️ Could not retrieve submission ID, skipping...[/yellow]\n")
+                continue
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console
+            ) as progress:
+                
+                # Extract questions
+                task = progress.add_task("🔍 Analyzing assignment...", total=None)
+                full_text = f"{assignment_title}\n\n{description}"
+                questions_data = solver.extract_questions(full_text)
+                
+                if questions_data['total_questions'] == 0:
+                    console.print("[yellow]No coding questions detected in assignment.[/yellow]\n")
+                    continue
+                
+                progress.update(task, description=f"✓ Found {questions_data['total_questions']} question(s)")
+                progress.stop()
+                
+                console.print(f"\n[green]Found {questions_data['total_questions']} coding question(s)[/green]")
+                console.print(f"[cyan]Language: {questions_data['language'].upper()}[/cyan]\n")
+                
+                # Generate solutions
+                solutions = []
+                for i, question in enumerate(questions_data['questions'], 1):
+                    console.print(f"💻 Solving Question {i}...")
+                    
+                    # Generate solution
+                    solution = solver.generate_solution(question, questions_data['language'])
+                    
+                    # Execute and capture
+                    output, screenshot = solver.execute_code_and_capture(
+                        solution['code'],
+                        questions_data['language'],
+                        solution.get('test_cases', [])
+                    )
+                    
+                    solution['output'] = output
+                    solution['screenshot'] = screenshot
+                    solutions.append(solution)
+                    
+                    console.print(f"[green]✓ Question {i} solved[/green]")
+                
+                total_solved += 1
+                
+                # Create PDF
+                console.print("\n📄 Generating solution PDF...")
+                pdf_filename = f"{assignment_title.replace(' ', '_')}_SOLUTION.pdf"
+                pdf_path = os.path.join(output_dir, pdf_filename)
+                
+                solver.create_solution_pdf(
+                    assignment_title,
+                    questions_data,
+                    solutions,
+                    pdf_path
+                )
+                
+                console.print(f"[green]✓ PDF saved: {pdf_path}[/green]\n")
+                
+                # Submit if requested
+                if auto_submit:
+                    console.print("📤 Uploading and submitting...")
+                    
+                    # Upload to Drive
+                    drive_file_id = solver.upload_to_drive(pdf_path, pdf_filename)
+                    
+                    if drive_file_id:
+                        # Submit assignment
+                        solver.submit_assignment(
+                            course['id'],
+                            assignment_id,
+                            submission_id,
+                            drive_file_id
+                        )
+                        total_submitted += 1
+                        console.print("[bold green]✅ Assignment submitted successfully![/bold green]\n")
+                    else:
+                        console.print("[red]Failed to upload file.[/red]\n")
+                else:
+                    console.print("[yellow]ℹ️  Use --auto-submit to automatically turn in assignments.[/yellow]\n")
+                
+                console.print("="*80 + "\n")
+    
+    # Summary
+    console.rule("[bold]Summary[/bold]")
+    console.print(f"📊 Total coding assignments detected: [bold]{total_assignments}[/bold]")
+    console.print(f"✅ Solutions generated: [bold green]{total_solved}[/bold green]")
+    console.print(f"📤 Submitted: [bold blue]{total_submitted}[/bold blue]")
+    console.print(f"\n💾 PDFs saved to: [cyan]{output_dir}[/cyan]\n")
 
-    # process-local-pdf (no submission)
-    p4 = sub.add_parser("process-pdf", help="Process a local PDF, generate solutions PDF (no submission)")
-    p4.add_argument("--pdf", required=True, help="Path to local assignment PDF")
-    p4.add_argument("--course-name", help="Course name (for title page)")
-    p4.add_argument("--assignment-name", help="Assignment name (for title page and filename)")
-    p4.add_argument("--student-name", default=DEFAULT_STUDENT_NAME, help="Student name for title page")
-    p4.add_argument("--keep-temp", action="store_true", help="Keep temp working directory for debugging")
-    p4.set_defaults(func=process_local_pdf_cmd)
 
-    args = parser.parse_args()
-    try:
-        args.func(args)
-    except HttpError as e:
-        logging.error(f"Google API error: {e}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nAborted by user.")
-        sys.exit(1)
+@app.command()
+def solve_manual(
+    assignment_text: str = typer.Argument(..., help="Assignment text or file path"),
+    language: str = typer.Option("python", help="Programming language (python/java/c++)"),
+    output: str = typer.Option("solution.pdf", help="Output PDF filename"),
+    credentials: str = typer.Option("credentials.json", help="Path to credentials file."),
+    token: str = typer.Option("token.pickle", help="Path to saved token file.")
+):
+    """
+    Manually solve an assignment from text or file (no Classroom integration).
+    """
+    console.print("🔧 [bold]Manual Assignment Solver[/bold]\n")
+    solver = AssignmentSolver(credentials_file=credentials, token_file=token)
+    
+    # Read from file if path provided
+    if os.path.exists(assignment_text):
+        with open(assignment_text, 'r') as f:
+            assignment_text = f.read()
+    
+    # Extract questions
+    console.print("🔍 Analyzing assignment...")
+    questions_data = solver.extract_questions(assignment_text)
+    questions_data['language'] = language  # Override with specified language
+    
+    if questions_data['total_questions'] == 0:
+        console.print("[red]No coding questions detected.[/red]")
+        raise typer.Exit()
+    
+    console.print(f"[green]Found {questions_data['total_questions']} question(s)[/green]\n")
+    
+    # Generate solutions
+    solutions = []
+    for i, question in enumerate(questions_data['questions'], 1):
+        console.print(f"💻 Solving Question {i}...")
+        solution = solver.generate_solution(question, language)
+        output_text, screenshot = solver.execute_code_and_capture(
+            solution['code'], language, solution.get('test_cases', [])
+        )
+        solution['output'] = output_text
+        solution['screenshot'] = screenshot
+        solutions.append(solution)
+        console.print(f"[green]✓ Question {i} solved[/green]")
+    
+    # Create PDF
+    console.print("\n📄 Generating PDF...")
+    solver.create_solution_pdf("Manual Assignment", questions_data, solutions, output)
+    console.print(f"[bold green]✅ PDF created: {output}[/bold green]\n")
 
 
 if __name__ == "__main__":
-    main()
+    app()
