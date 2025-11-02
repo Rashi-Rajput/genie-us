@@ -230,6 +230,7 @@ class StudyBuddyCLI:
             ts = ts.split('.')[0] + 'Z'
         return datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
 
+    # --- MODIFIED FUNCTION ---
     def get_drive_file_text(self, drive_file) -> Optional[str]:
         """
         Downloads a Google Drive file (Doc, PDF) and extracts all text.
@@ -237,13 +238,16 @@ class StudyBuddyCLI:
         file_id = drive_file.get('id')
         name = drive_file.get('title', 'Unknown File')
         
+        # --- NEW DEBUG LINE ---
+        console.print(f"  > Attempting to access file ID: {file_id} (Name: [dim]{name}[/dim])")
+        
         # Get file metadata to check its MIME type
         try:
             metadata = self.drive_service.files().get(fileId=file_id, fields='mimeType, name').execute()
             mime_type = metadata.get('mimeType')
             name = metadata.get('name', name)
             
-            console.print(f"  > Reading file: [dim]{name}[/dim] (Type: {mime_type})")
+            console.print(f"    > Reading file: [dim]{name}[/dim] (Type: {mime_type})")
             
             request = None
             if 'google-apps.document' in mime_type:
@@ -260,7 +264,7 @@ class StudyBuddyCLI:
                 # It's a PDF, download directly
                 request = self.drive_service.files().get_media(fileId=file_id)
             else:
-                console.print(f"  [yellow]Skipping unsupported file type: {mime_type}[/yellow]")
+                console.print(f"    [yellow]Skipping unsupported file type: {mime_type}[/yellow]")
                 return None
 
             # Download the file content
@@ -281,14 +285,16 @@ class StudyBuddyCLI:
                         )
                         return full_text
                 except Exception as e:
-                    console.print(f"  [red]Error reading PDF content: {e}[/red]")
+                    console.print(f"    [red]Error reading PDF content: {e}[/red]")
                     return None
             else:
                 # It was exported as plain text
                 return fh.read().decode('utf-8')
 
         except HttpError as e:
-            console.print(f"  [red]Error accessing Drive file {name}: {e}[/red]")
+            # --- MODIFIED ERROR LINES ---
+            console.print(f"  [red]Error accessing Drive file. Name: {name}, ID: {file_id}[/red]")
+            console.print(f"  [red]Full error: {e}[/red]")
             return None
 
     def _upload_to_drive(self, content: str, filename: str, mime_type: str = 'text/markdown') -> Optional[str]:
@@ -504,7 +510,7 @@ def detect(
             course_info = cli.classroom_service.courses().get(id=course_id).execute()
             course_name = course_info.get('name', f'Course {course_id}')
             courses = [{'id': course_id, 'name': course_name}]
-        except HttpError:
+        except HttpError as e:
             console.print(f"[red]Error: Could not find course with ID {course_id}[/red]")
             raise typer.Exit()
     elif all_courses:
