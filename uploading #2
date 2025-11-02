@@ -6,14 +6,14 @@ Google Classroom Buddy - Merged Tool
 This single CLI tool connects to the Google Classroom and Drive APIs to:
 1.  (detect-materials) Detect new lecture materials (PDFs, Docs), generate
     study aids (Audio, Flashcards, Quizzes), and upload them to Google Drive.
-2.  (detect-assignments) Detect new assignments with coding questions
-    (Java, Python, C++) and generate Markdown solutions.
-3.  (detect-announcements) Detect new announcements, scan for keywords
+2.  (detect-announcements) Detect new announcements, scan for keywords
     (project, lab test), and generate tailored project ideas or practice questions.
-4.  (summarize-announcements) Provide a single AI summary for all recent
+3.  (summarize-announcements) Provide a single AI summary for all recent
     announcements in a course.
-5.  (analyze-announcement) Manually analyze any piece of text for
+4.  (analyze-announcement) Manually analyze any piece of text for
     project/lab test content.
+5.  (solve-assignment) Manually paste an assignment problem and generate
+    a detailed solution and explanation.
 6.  (list-courses) List all your active courses.
 
 Setup:
@@ -30,8 +30,8 @@ Setup:
    python merged_buddy.py list-courses
 6. Run other commands:
    python merged_buddy.py detect-materials --all-courses --since 24
-   python merged_buddy.py detect-assignments --all-courses --since 48
    python merged_buddy.py detect-announcements --all-courses --since 72
+   python merged_buddy.py solve-assignment "Explain..." --course-name "DSA"
 """
 
 import os
@@ -67,11 +67,10 @@ console = Console()
 load_dotenv()
 
 # --- MERGED SCOPES ---
-# We need all permissions from all scripts
+# We need all permissions from both scripts
 SCOPES = [
     'https://www.googleapis.com/auth/classroom.courses.readonly',
     'https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly', # For Study Buddy
-    'https://www.googleapis.com/auth/classroom.coursework.readonly',        # *** NEW: For Assignment Detector ***
     'https://www.googleapis.com/auth/classroom.announcements.readonly',      # For Monitor
     'https://www.googleapis.com/auth/drive.readonly',                       # For Study Buddy
     'https://www.googleapis.com/auth/drive.file'                            # For Study Buddy
@@ -89,13 +88,6 @@ PROJECT_KEYWORDS = [
 LAB_TEST_KEYWORDS = [
     'lab test', 'evaluation', 'practical exam', 'viva', 'quiz',
     'midterm', 'final exam', 'coding test', 'assessment', 'lab evaluation'
-]
-
-# *** NEW: Keywords for Assignment Solution Generator ***
-CODING_KEYWORDS = [
-    'java', 'python', 'c++', 'cpp', 'coding question', 'algorithm', 'implement',
-    'write a program', 'write a function', 'leetcode', 'hackerrank', 'data structure',
-    'array', 'string', 'hashmap', 'linked list', 'tree', 'graph'
 ]
 
 # ---------------------- Core Class (Merged) ----------------------
@@ -127,7 +119,7 @@ class ClassroomBuddyCLI:
                     console.print("[yellow]Please re-authenticate.[/yellow]")
                     creds = None # Force re-authentication
                     if os.path.exists(self.token_file):
-                         os.remove(self.token_file) # Delete bad token
+                        os.remove(self.token_file) # Delete bad token
             
             if not creds:
                 if not os.path.exists(self.credentials_file):
@@ -220,50 +212,6 @@ class ClassroomBuddyCLI:
             console.print(f"[red]⚠️ Error fetching materials for course {course_id}:[/red] {e}")
             return []
 
-    # *** NEW: Method to get assignments (courseWork) ***
-    def get_new_assignments(self, course_id, since_hours):
-        """
-        Fetch new courseWork items (assignments, quizzes, etc.)
-        """
-        try:
-            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=since_hours)
-            
-            assignments = []
-            page_token = None
-            while True:
-                response = self.classroom_service.courses().courseWork().list(
-                    courseId=course_id,
-                    pageSize=20,
-                    pageToken=page_token,
-                    orderBy='updateTime desc'
-                ).execute()
-                
-                items = response.get('courseWork', [])
-                
-                if not items:
-                    break
-                    
-                for item in items:
-                    update_time = self._parse_timestamp(item.get('updateTime'))
-                    if update_time > cutoff_time:
-                        assignments.append(item)
-                    else:
-                        # Stop paging once we hit old items
-                        page_token = None # Force stop
-                        break
-                
-                if not page_token:
-                    break
-                    
-                page_token = response.get('nextPageToken')
-                if not page_token:
-                    break
-                    
-            return assignments
-        except HttpError as e:
-            console.print(f"[red]⚠️ Error fetching assignments for course {course_id}:[/red] {e}")
-            return []
-
     def get_announcements(self, course_id, max_results=10, since_hours=None):
         """Retrieve course announcements."""
         try:
@@ -288,7 +236,6 @@ class ClassroomBuddyCLI:
 
                 if since_hours:
                     filtered_items = []
-                    stop_paging = False
                     for i in items:
                         # Use the robust, timezone-aware parser
                         update_time = self._parse_timestamp(i.get('updateTime'))
@@ -297,11 +244,10 @@ class ClassroomBuddyCLI:
                         else:
                             # Since announcements are sorted by updateTime desc,
                             # we can stop once we hit an old one.
-                            stop_paging = True
+                            items = filtered_items # Use only the items we found
+                            page_token = None # Force stop paging
                             break
                     items = filtered_items
-                    if stop_paging:
-                        page_token = None # Force stop paging
                 
                 announcements.extend(items)
                 page_token = response.get('nextPageToken')
@@ -480,75 +426,6 @@ class ClassroomBuddyCLI:
         """
         return self._run_gemini_prompt(prompt, text)
         
-    # *** NEW: Gemini prompt for generating coding solutions ***
-    def generate_coding_solutions(self, text: str, keywords: List[str]) -> str:
-        """
-        Generate solutions for coding assignments.
-        'text' will be passed as 'lecture_text' to _run_gemini_prompt
-        """
-        prompt = f"""
-    You are an expert programmer and teaching assistant. You are given an assignment description
-    (at the end of this prompt) and must provide solutions in Markdown format.
-
-    Detected Coding Keywords: {', '.join(keywords)}
-
-    Your task:
-    1.  Carefully analyze the assignment text to identify all coding questions.
-    2.  For each coding question, provide a detailed solution.
-    3.  If multiple languages are possible (based on keywords like 'java', 'python', 'cpp'),
-        try to provide the solution in the most likely language, or provide all if feasible.
-    4.  Structure the output clearly in Markdown.
-    5.  For each solution, include:
-        - A clear header (e.g., `## Question 1: Two Sum`)
-        - The problem statement (if you can extract it).
-        - The full, correct, and well-commented code solution.
-        - An explanation of the code, its logic, and any key concepts used.
-        - Discussion of time and space complexity (e.g., $O(n)$).
-
-    Example Format:
-    
-    ## Question 1: Implement a Stack in Python
-
-    **Problem:** Write a Python class `Stack` that supports `push`, `pop`, `peek`, and `isEmpty` operations.
-
-    **Solution (Python):**
-    ```python
-    class Stack:
-        def __init__(self):
-            self.items = []
-
-        def isEmpty(self):
-            return self.items == []
-
-        def push(self, item):
-            self.items.append(item)
-
-        def pop(self):
-            if not self.isEmpty():
-                return self.items.pop()
-            else:
-                return "Error: Stack is empty"
-
-        def peek(self):
-            if not self.isEmpty():
-                return self.items[len(self.items)-1]
-            else:
-                return "Error: Stack is empty"
-    ```
-
-    **Explanation:**
-    This code implements a stack using a Python list.
-    * `__init__`: Initializes an empty list.
-    * `push`: Appends an item to the end of the list (top of the stack).
-    * `pop`: Removes and returns the last item from the list.
-
-    **Complexity:**
-    * Push: $O(1)$
-    * Pop: $O(1)$
-    """
-        # The _run_gemini_prompt function will append the assignment text
-        return self._run_gemini_prompt(prompt, text)
-
     # --- Gemini Generation: Announcement Analysis (from Monitor) ---
 
     def summarize_course_announcements(self, course_name, announcements):
@@ -760,6 +637,55 @@ Be SPECIFIC, PRACTICAL, and ensure all questions are directly relevant to the an
         except Exception as e:
             return f"⚠️ Error generating practice questions: {str(e)}"
 
+    def generate_assignment_solution(self, course_name: str, assignment_text: str) -> str:
+        """
+        Generates a detailed solution and explanation for a given assignment.
+        """
+        prompt = f"""
+You are an expert academic tutor and teaching assistant.
+Your goal is to provide a comprehensive, well-explained solution to the following assignment,
+helping the student learn the underlying concepts.
+
+Course: {course_name}
+Assignment Text:
+---
+{assignment_text}
+---
+
+Your task is to generate a detailed solution. Please structure your response as follows:
+
+1.  **Understanding the Problem:**
+    * Briefly summarize the assignment's main objective.
+    * Identify the key requirements, inputs, and expected outputs.
+
+2.  **Core Concepts:**
+    * List the key academic concepts, algorithms, or principles needed to solve this problem.
+    * Provide a brief explanation of each concept (e.g., "This problem requires using a Stack for LIFO operations...").
+
+3.  **Step-by-Step Solution:**
+    * Provide a logical, step-by-step walkthrough of how to arrive at the solution.
+    * Explain your reasoning at each step.
+
+4.  **Final Solution/Code:**
+    * If the assignment is a coding problem, provide the complete, well-commented solution code.
+    * Use appropriate Markdown code blocks (e.g., ```python ... ```).
+    * If it's a theoretical, mathematical, or essay question, provide the final, well-structured answer.
+
+5.  **Explanation of Solution:**
+    * Walk through your code or final answer, explaining *why* it works and how it meets the assignment requirements.
+
+6.  **Potential Pitfalls & Self-Test Cases:**
+    * Mention 2-3 common mistakes students might make.
+    * Suggest 2-3 test cases (e.g., "What if the input is an empty list?", "What about edge cases like...").
+
+Format your entire response clearly using Markdown.
+"""
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            return f"⚠️ Error generating assignment solution: {str(e)}"
+
 
 # ---------------------- Helper Function (from Monitor) ----------------------
 
@@ -926,117 +852,6 @@ def detect_materials(
     console.rule("[bold]Material Detection Complete[/bold]")
     console.print(f"✅ Scanned [bold]{len(courses)}[/bold] course(s).")
     console.print(f"🎯 Found [bold]{total_materials_found}[/bold] new materials.")
-    console.print()
-
-
-# *** NEW: Command to detect coding assignments and generate solutions ***
-@app.command("detect-assignments")
-def detect_assignments(
-    course_id: str = typer.Option(None, "--course-id", help="Specific course ID to scan."),
-    all_courses: bool = typer.Option(False, "--all-courses", help="Scan all available courses."),
-    since: int = typer.Option(48, help="Only scan assignments from last N hours."),
-    credentials: str = typer.Option("credentials.json", help="Path to credentials file"),
-    token: str = typer.Option("token.pickle", help="Path to saved token file.")
-):
-    """
-    Detect new assignments with coding questions and generate solutions.
-    """
-    console.print("🚀 [bold]Initializing Assignment Detector...[/bold]")
-    cli = ClassroomBuddyCLI(credentials_file=credentials, token_file=token)
-    print()
-
-    # Determine which courses to process
-    if course_id:
-        try:
-            course_info = cli.classroom_service.courses().get(id=course_id).execute()
-            course_name = course_info.get('name', f'Course {course_id}')
-            courses = [{'id': course_id, 'name': course_name}]
-        except HttpError:
-            console.print(f"[red]Error: Could not find course with ID {course_id}[/red]")
-            raise typer.Exit()
-    elif all_courses:
-        courses = cli.get_courses()
-        if not courses:
-            console.print("[red]No active courses found.[/red]")
-            raise typer.Exit()
-    else:
-        console.print("[yellow]❗ Please specify either --course-id or --all-courses.[/yellow]")
-        raise typer.Exit()
-
-    # --- Main Processing Loop ---
-    total_assignments_found = 0
-    total_coding_assignments = 0
-    for course in courses:
-        course_name = course['name']
-        console.rule(f"[bold blue]🔍 Scanning for Assignments: {course_name}[/bold blue]")
-        
-        new_assignments = cli.get_new_assignments(course['id'], since_hours=since)
-        
-        if not new_assignments:
-            console.print(f"[dim]No new assignments found in the last {since} hours.[/dim]\n")
-            continue
-            
-        console.print(f"📢 Found [green]{len(new_assignments)}[/green] new assignment(s)!")
-        total_assignments_found += len(new_assignments)
-        
-        for assignment in new_assignments:
-            title = assignment.get('title', 'Untitled Assignment')
-            console.print(f"\n[bold]Processing Assignment:[/bold] [cyan]{title}[/cyan]")
-            
-            # --- Text Extraction (from description AND materials) ---
-            full_assignment_text = assignment.get('description', '')
-            
-            if assignment.get('materials'):
-                for item in assignment.get('materials', []):
-                    drive_file = item.get('driveFile', {}).get('driveFile')
-                    if drive_file:
-                        text = cli.get_drive_file_text(drive_file)
-                        if text:
-                            full_assignment_text += f"\n\n--- (Source: {drive_file.get('title', 'N/A')}) ---\n{text}"
-            
-            if not full_assignment_text.strip():
-                console.print("[yellow]  > No text found in description or attachments. Skipping.[/yellow]")
-                continue
-            
-            console.print(f"[green]  ✓ Extracted {len(full_assignment_text.split())} words of text.[/green]")
-
-            # --- Keyword Detection ---
-            matched_keywords = []
-            text_lower = full_assignment_text.lower()
-            for keyword in CODING_KEYWORDS:
-                if re.search(r'\b' + re.escape(keyword) + r'\b', text_lower, re.IGNORECASE):
-                    matched_keywords.append(keyword)
-            
-            if not matched_keywords:
-                console.print("[dim]  > No coding keywords detected. Skipping solution generation.[/dim]")
-                continue
-
-            total_coding_assignments += 1
-            console.print(f"  [bold magenta]Detected coding keywords:[/bold magenta] {', '.join(matched_keywords)}")
-            
-            # --- Interactive Generation ---
-            if not typer.confirm(f"\n🧠 Do you want to generate solutions for '{title}'?"):
-                console.print("[dim]  > Skipping generation.[/dim]")
-                continue
-
-            base_filename = f"{re.sub(r'[^\w\-_\. ]', '', title).replace(' ', '_')}"
-            
-            # Generate Solutions
-            with Status("[bold magenta]Generating coding solutions... (This may take a moment)[/bold magenta]", console=console):
-                try:
-                    content = cli.generate_coding_solutions(full_assignment_text, matched_keywords)
-                    filename = f"Solutions-{base_filename}.md"
-                    link = cli._upload_to_drive(content, filename)
-                    console.print(f"  [green]✓ Solutions generated![/green] [dim]({link})[/dim]")
-                except Exception as e:
-                     console.print(f"  [red]Error generating solutions: {e}[/red]")
-
-            console.print(f"\n[bold green]✅ Done processing '{title}'![/bold green]")
-            
-    console.rule("[bold]Assignment Detection Complete[/bold]")
-    console.print(f"✅ Scanned [bold]{len(courses)}[/bold] course(s).")
-    console.print(f"🎯 Found [bold]{total_assignments_found}[/bold] new assignments.")
-    console.print(f"💻 Detected [bold]{total_coding_assignments}[/bold] coding-related assignments.")
     console.print()
 
 
@@ -1359,6 +1174,47 @@ def analyze_announcement(
         # Ask to save the practice questions
         _ask_to_save_md(practice_questions, course_name, "practice-questions-manual", console)
         
+    console.print()
+
+
+@app.command("solve-assignment")
+def solve_assignment(
+    assignment_text: str = typer.Argument(..., help="The full text of the assignment problem"),
+    course_name: str = typer.Option("General", help="Course name for context"),
+    credentials: str = typer.Option("credentials.json", help="Path to credentials file."),
+    token: str = typer.Option("token.pickle", help="Path to saved token file.")
+):
+    """
+    Generate a detailed solution for a given assignment text.
+    """
+    console.print(f"🧠 [bold]Generating solution for assignment in: {course_name}[/bold]\n")
+    # Authentication is needed to set up the Gemini model
+    cli = ClassroomBuddyCLI(credentials_file=credentials, token_file=token)
+    
+    console.print(Panel(
+        f"[bold yellow]📝 Assignment Text:[/bold yellow]\n{assignment_text}",
+        title=f"[bold cyan]Assignment Problem[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2)
+    ))
+    
+    console.print("\n💡 [bold magenta]Generating detailed solution... (This may take a moment)[/bold magenta]\n")
+    
+    with Status("[bold magenta]Thinking...[/bold magenta]", console=console):
+        solution_text = cli.generate_assignment_solution(
+            course_name, 
+            assignment_text
+        )
+    
+    console.print(Panel(
+        Markdown(solution_text),
+        title=f"[bold green]✅ Generated Solution & Explanation[/bold green]",
+        border_style="green",
+        padding=(1, 2)
+    ))
+    
+    # Ask to save the solution
+    _ask_to_save_md(solution_text, course_name, "assignment-solution-manual", console)
     console.print()
 
 
