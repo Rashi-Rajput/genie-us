@@ -148,7 +148,7 @@ class ClassroomBuddyCLI:
         if not api_key:
             raise ValueError("Missing GEMINI_API_KEY in environment variables (.env file).")
         genai.configure(api_key=api_key)
-        self.gemini_model = genai.GenerativeModel('models/gemini-1.5-flash')
+        self.gemini_model = genai.GenerativeModel('models/gemini-2.5-flash')
         console.print("[green]✓ Gemini AI configured![/green]")
 
     def _parse_timestamp(self, ts: str):
@@ -947,3 +947,184 @@ def detect_announcements(
                 
                 console.print(Panel(
                     f"[bold yellow]📅 Posted:[/bold yellow] {timestamp}\n\n"
+                    f"[bold yellow]🔑 Detected Keywords:[/bold yellow] {', '.join(keywords)}\n\n"
+                    f"[bold yellow]📝 Full Announcement:[/bold yellow]\n{text}",
+                    title=f"[bold cyan]Project Announcement #{idx} - {course['name']}[/bold cyan]",
+                    border_style="cyan",
+                    padding=(1, 2)
+                ))
+                
+                if keywords_only:
+                    console.print()
+                    continue
+                
+                console.print("\n💡 [bold magenta]Analyzing announcement and generating tailored project ideas...[/bold magenta]\n")
+                
+                project_ideas = cli.generate_tailored_project_ideas(
+                    course['name'], 
+                    text, 
+                    keywords
+                )
+                
+                console.print(Panel(
+                    Markdown(project_ideas),
+                    title=f"[bold green]🚀 Tailored Project Ideas & Resources[/bold green]",
+                    border_style="green",
+                    padding=(1, 2)
+                ))
+                
+                # Ask to save the project ideas
+                _ask_to_save_md(project_ideas, course['name'], f"project-ideas-{idx}", console)
+                
+                console.print("\n" + "="*80 + "\n")
+
+        # --- Process Lab Test Announcements ---
+        if lab_test_anns:
+            total_lab_tests_detected += len(lab_test_anns)
+            console.print(f"🧪 [bold yellow]Found {len(lab_test_anns)} lab test/evaluation announcement(s)![/bold yellow]\n")
+            
+            for idx, (ann, keywords) in enumerate(lab_test_anns, start=1):
+                timestamp = cli._parse_timestamp(ann.get('updateTime')).strftime("%Y-%m-%d %H:%M")
+                text = ann.get('text', 'No content').strip()
+                
+                console.print(Panel(
+                    f"[bold yellow]📅 Posted:[/bold yellow] {timestamp}\n\n"
+                    f"[bold yellow]🔑 Detected Keywords:[/bold yellow] {', '.join(keywords)}\n\n"
+                    f"[bold yellow]📝 Full Announcement:[/bold yellow]\n{text}",
+                    title=f"[bold magenta]Lab Test Announcement #{idx} - {course['name']}[/bold magenta]",
+                    border_style="magenta",
+                    padding=(1, 2)
+                ))
+                
+                if keywords_only:
+                    console.print()
+                    continue
+                    
+                console.print("\n💡 [bold cyan]Analyzing announcement and generating practice questions...[/bold cyan]\n")
+                
+                practice_questions = cli.generate_practice_questions(
+                    course['name'], 
+                    text, 
+                    keywords
+                )
+                
+                console.print(Panel(
+                    Markdown(practice_questions),
+                    title=f"[bold blue]📚 Practice Questions & Study Guide[/bold blue]",
+                    border_style="blue",
+                    padding=(1, 2)
+                ))
+                
+                # Ask to save the practice questions
+                _ask_to_save_md(practice_questions, course['name'], f"practice-questions-{idx}", console)
+                
+                console.print("\n" + "="*80 + "\n")
+
+    # Summary
+    console.rule("[bold]Announcement Detection Complete[/bold]")
+    console.print(f"✅ Scanned [bold]{total_announcements}[/bold] announcements across [bold]{len(courses)}[/bold] course(s)")
+    console.print(f"🎯 Detected [bold green]{total_projects_detected}[/bold green] project-related announcements")
+    console.print(f"🧪 Detected [bold yellow]{total_lab_tests_detected}[/bold yellow] lab test/evaluation announcements")
+    
+    if total_projects_detected == 0 and total_lab_tests_detected == 0:
+        console.print("\n[yellow]💡 Tip: Try increasing the scan window with --since option or check more courses with --all-courses[/yellow]")
+    
+    console.print()
+
+
+# --- Command from Monitor Script (Renamed) ---
+@app.command("analyze-announcement")
+def analyze_announcement(
+    announcement_text: str = typer.Argument(..., help="Project announcement text to analyze"),
+    course_name: str = typer.Option("General", help="Course name for context"),
+    credentials: str = typer.Option("credentials.json", help="Path to credentials file."),
+    token: str = typer.Option("token.pickle", help="Path to saved token file.")
+):
+    """
+    Analyze specific announcement text and generate tailored project/lab ideas.
+    """
+    console.print(f"🔍 [bold]Analyzing announcement text for: {course_name}[/bold]\n")
+    # Authentication is needed just to set up the Gemini model
+    cli = ClassroomBuddyCLI(credentials_file=credentials, token_file=token)
+    
+    # Detect project keywords
+    project_keywords = []
+    text_lower = announcement_text.lower()
+    for keyword in PROJECT_KEYWORDS:
+        if re.search(r'\b' + re.escape(keyword) + r'\b', text_lower, re.IGNORECASE):
+            project_keywords.append(keyword)
+    
+    # Detect lab test keywords
+    lab_test_keywords = []
+    for keyword in LAB_TEST_KEYWORDS:
+        if re.search(r'\b' + re.escape(keyword) + r'\b', text_lower, re.IGNORECASE):
+            lab_test_keywords.append(keyword)
+
+    if not project_keywords and not lab_test_keywords:
+        console.print("[yellow]⚠️ No project or lab test keywords detected in the provided text.[/yellow]")
+        console.print(f"[dim]Project keywords: {', '.join(PROJECT_KEYWORDS[:5])}...[/dim]")
+        console.print(f"[dim]Lab Test keywords: {', '.join(LAB_TEST_KEYWORDS[:5])}...[/dim]\n")
+        return
+
+    # Prioritize Projects: If project keywords are present, run project analysis
+    if project_keywords:
+        console.print(Panel(
+            f"[bold yellow]🔑 Detected Project Keywords:[/bold yellow] {', '.join(project_keywords)}\n\n"
+            f"[bold yellow]📝 Announcement Text:[/bold yellow]\n{announcement_text}",
+            title=f"[bold cyan]Project Announcement Analysis[/bold cyan]",
+            border_style="cyan",
+            padding=(1, 2)
+        ))
+        
+        console.print("\n💡 [bold magenta]Generating tailored project ideas...[/bold magenta]\n")
+        
+        project_ideas = cli.generate_tailored_project_ideas(
+            course_name, 
+            announcement_text, 
+            project_keywords
+        )
+        
+        console.print(Panel(
+            Markdown(project_ideas),
+            title=f"[bold green]🚀 Tailored Project Ideas & Resources[/bold green]",
+            border_style="green",
+            padding=(1, 2)
+        ))
+        
+        # Ask to save the project ideas
+        _ask_to_save_md(project_ideas, course_name, "project-ideas-manual", console)
+    
+    # Else If: If no project keywords, but lab test keywords are present, run lab test analysis
+    elif lab_test_keywords:
+        console.print(Panel(
+            f"[bold yellow]🔑 Detected Lab Test Keywords:[/bold yellow] {', '.join(lab_test_keywords)}\n\n"
+            f"[bold yellow]📝 Announcement Text:[/bold yellow]\n{announcement_text}",
+            title=f"[bold magenta]Lab Test Announcement Analysis[/bold magenta]",
+            border_style="magenta",
+            padding=(1, 2)
+        ))
+        
+        console.print("\n💡 [bold cyan]Analyzing announcement and generating practice questions...[/bold cyan]\n")
+        
+        practice_questions = cli.generate_practice_questions(
+            course_name, 
+            announcement_text, 
+            lab_test_keywords
+        )
+        
+        console.print(Panel(
+            Markdown(practice_questions),
+            title=f"[bold blue]📚 Practice Questions & Study Guide[/bold blue]",
+            border_style="blue",
+            padding=(1, 2)
+        ))
+        
+        # Ask to save the practice questions
+        _ask_to_save_md(practice_questions, course_name, "practice-questions-manual", console)
+        
+    console.print()
+
+
+# ---------------------- Main ----------------------
+if __name__ == "__main__":
+    app()
