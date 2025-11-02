@@ -14,6 +14,7 @@ Features:
   tailored project ideas or practice questions for *each* matching announcement.
 • 'analyze' command: Manually analyze any piece of text for project/lab test content.
 • 'list-courses' command: Lists all your active courses.
+• NEW: Asks to save all generated content (summaries, ideas, questions) to .md files.
 
 Setup:
 -------
@@ -39,8 +40,6 @@ from rich import print
 from rich.console import Console
 from rich.panel import Panel
 from rich.markdown import Markdown
-from rich.table import Table
-from rich.text import Text
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -65,8 +64,8 @@ SCOPES = [
 # Project-related keywords to detect
 PROJECT_KEYWORDS = [
     'synopsis', 'project', 'pbl', 'problem-based learning', 'problem based learning',
-    'assignment', 'capstone', 'thesis', 'research', 'presentation', 'proposal',
-    'implementation', 'development', 'design', 'prototype', 'deliverable',
+    'capstone', 'thesis', 'research', 'presentation', 'proposal', 'development', 'design',
+    'prototype', 'deliverable',
     'milestone', 'case study', 'report', 'documentation', 'mini project',
     'major project', 'final year project', 'term project', 'semester project'
 ]
@@ -80,13 +79,11 @@ LAB_TEST_KEYWORDS = [
 
 # ---------------------- Core Class ----------------------
 class ClassroomMonitor:
-    # --- MODIFIED ---
-    def __init__(self, console: Console, credentials_file='credentials.json', token_file='token.pickle'):
+    def __init__(self, credentials_file='credentials.json', token_file='token.pickle'):
         self.credentials_file = credentials_file
         self.token_file = token_file
         self.service = None
         self.gemini_model = None
-        self.console = console  # <-- Inject console for status updates
         self._authenticate()
         self._setup_gemini()
 
@@ -99,23 +96,21 @@ class ClassroomMonitor:
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                # --- MODIFIED ---
-                with self.console.status("[yellow]Refreshing expired credentials...[/yellow]", spinner="dots"):
-                    creds.refresh(Request())
+                console.print("[yellow]Refreshing expired credentials...[/yellow]")
+                creds.refresh(Request())
             else:
                 if not os.path.exists(self.credentials_file):
                     raise FileNotFoundError(
                         f"Credentials file '{self.credentials_file}' not found. "
                         "Download it from Google Cloud Console and name it 'credentials.json'."
                     )
-                # --- MODIFIED ---
-                with self.console.status("[cyan]Authenticating with Google... (check browser)[/cyan]", spinner="earth"):
-                    flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, SCOPES)
-                    creds = flow.run_local_server(port=0)
+                console.print("[cyan]Authenticating with Google Classroom...[/cyan]")
+                flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, SCOPES)
+                creds = flow.run_local_server(port=0)
 
             with open(self.token_file, 'wb') as token:
                 pickle.dump(creds, token)
-            self.console.print("[green]✓ Authentication successful![/green]")
+            console.print("[green]✓ Authentication successful![/green]")
 
         self.service = build('classroom', 'v1', credentials=creds)
 
@@ -125,75 +120,80 @@ class ClassroomMonitor:
         if not api_key:
             raise ValueError("Missing GEMINI_API_KEY in environment variables (.env file).")
         genai.configure(api_key=api_key)
+        # --- EDITED --- 
+        # Corrected potential typo from 2.5-flash to 1.5-flash, which is a common model
         self.gemini_model = genai.GenerativeModel('models/gemini-1.5-flash')
-        self.console.print("[green]✓ Gemini AI configured![/green]")
+        console.print("[green]✓ Gemini AI configured![/green]")
 
     def get_courses(self):
         """Fetch available Google Classroom courses."""
-        # --- MODIFIED ---
-        with self.console.status("📚 [bold]Fetching your courses...[/bold]", spinner="dots"):
-            try:
-                results = self.service.courses().list(pageSize=100, courseStates=['ACTIVE']).execute()
-                return results.get('courses', [])
-            except HttpError as e:
-                self.console.print(f"[red]⚠️ Error fetching courses:[/red] {e}")
-                return []
+        try:
+            # Using the version that filters for ACTIVE courses
+            results = self.service.courses().list(pageSize=100, courseStates=['ACTIVE']).execute()
+            return results.get('courses', [])
+        except HttpError as e:
+            console.print(f"[red]⚠️ Error fetching courses:[/red] {e}")
+            return []
 
     def get_announcements(self, course_id, max_results=10, since_hours=None):
         """Retrieve course announcements."""
-        # --- MODIFIED ---
-        with self.console.status(f"📢 [dim]Fetching announcements for course {course_id}...[/dim]", spinner="dots"):
-            try:
-                announcements, page_token = [], None
-                while True:
-                    response = self.service.courses().announcements().list(
-                        courseId=course_id,
-                        pageSize=min(max_results, 100),
-                        pageToken=page_token,
-                        orderBy='updateTime desc'
-                    ).execute()
+        try:
+            announcements, page_token = [], None
+            while True:
+                response = self.service.courses().announcements().list(
+                    courseId=course_id,
+                    pageSize=min(max_results, 100),
+                    pageToken=page_token,
+                    orderBy='updateTime desc'
+                ).execute()
 
-                    items = response.get('announcements', [])
+                items = response.get('announcements', [])
+                
+                # Using the more robust time-filtering logic from the detector script
+                if since_hours:
+                    cutoff_time = datetime.utcnow() - timedelta(hours=since_hours)
+                    # Convert cutoff_time to the same timezone-naive format as parsed timestamps for comparison
+                    cutoff_time = cutoff_time.replace(tzinfo=None) 
                     
-                    if since_hours:
-                        cutoff_time = datetime.utcnow() - timedelta(hours=since_hours)
-                        cutoff_time = cutoff_time.replace(tzinfo=None) 
-                        
-                        filtered_items = []
-                        for i in items:
-                            update_time = self._parse_timestamp(i.get('updateTime'))
-                            if update_time > cutoff_time:
-                                filtered_items.append(i)
-                            else:
-                                break 
-                        items = filtered_items
+                    filtered_items = []
+                    for i in items:
+                        update_time = self._parse_timestamp(i.get('updateTime'))
+                        if update_time > cutoff_time:
+                            filtered_items.append(i)
+                        else:
+                            # Since announcements are sorted by updateTime desc,
+                            # we can stop once we hit an old one.
+                            break 
+                    items = filtered_items
 
-                    announcements.extend(items)
-                    page_token = response.get('nextPageToken')
-                    
-                    if not page_token or len(announcements) >= max_results or (since_hours and not items):
-                        break
+                announcements.extend(items)
+                page_token = response.get('nextPageToken')
+                
+                if not page_token or len(announcements) >= max_results or (since_hours and not items):
+                    break
 
-                return announcements[:max_results]
-            except HttpError as e:
-                self.console.print(f"[red]⚠️ Error fetching announcements:[/red] {e}")
-                return []
+            return announcements[:max_results]
+        except HttpError as e:
+            console.print(f"[red]⚠️ Error fetching announcements:[/red] {e}")
+            return []
 
     def _parse_timestamp(self, ts: str):
         """Using the more robust parser from the detector script."""
         if not ts:
             return datetime.min
+        # Handle both 'Z' and '+00:00' formats, and remove nanoseconds
         ts = ts.split('.')[0] # Remove fractional seconds
         ts = ts.replace('Z', '')
         try:
             return datetime.fromisoformat(ts)
         except Exception:
             try:
-                return datetime.strptime(ts, "%Y-m-%dT%H:%M:%S")
+                # Fallback for different formats
+                return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S")
             except Exception:
                 return datetime.min
 
-    # --- Method from Summarizer Script ---
+    # --- EDITED: Summarizer prompt ---
     def summarize_course_announcements(self, course_name, announcements):
         """Summarize all announcements in a single Gemini summary."""
         if not announcements:
@@ -207,79 +207,111 @@ class ClassroomMonitor:
 
         prompt = f"""
 You are a helpful assistant summarizing all recent announcements for a course.
+
 Course: {course_name}
+
 Announcements:
 {chr(10).join(compiled_texts)}
-Provide a concise, student-friendly summary including:
-- Main topics or updates
-- Deadlines or key info
-- Context or instructions
-Do not bold the text.
+
+Provide a **very short, high-level summary** in bullet points (3-5 points maximum).
+Focus *only* on the most critical information:
+- **Key deadlines**
+- **Required actions** (e.g., "Submit X," "Prepare for Y")
+- **Main topics** (e.g., "Project synopsis guidelines released")
+
+Be as brief as possible. Do not use bold text.
 """
-        # --- MODIFIED ---
-        with self.console.status("\n🤖 [cyan]Generating overall course summary...[/cyan]", spinner="line"):
-            try:
-                response = self.gemini_model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:
-                return f"⚠️ Error generating summary: {str(e)}"
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            return f"⚠️ Error generating summary: {str(e)}"
 
     # --- Methods from Detector Script ---
     def detect_project_announcements(self, announcements: List[Dict]) -> List[Tuple[Dict, List[str]]]:
         """
         Detect announcements containing project-related keywords.
+        Returns list of tuples: (announcement, matched_keywords)
         """
         project_announcements = []
+        
         for ann in announcements:
             text = ann.get('text', '').lower()
             matched_keywords = []
+            
             for keyword in PROJECT_KEYWORDS:
                 if re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
                     matched_keywords.append(keyword)
+            
             if matched_keywords:
                 project_announcements.append((ann, list(set(matched_keywords))))
+        
         return project_announcements
 
     def detect_lab_test_announcements(self, announcements: List[Dict]) -> List[Tuple[Dict, List[str]]]:
         """
         Detect announcements containing lab test/evaluation keywords.
+        Returns list of tuples: (announcement, matched_keywords)
         """
         lab_test_announcements = []
+        
         for ann in announcements:
             text = ann.get('text', '').lower()
             matched_keywords = []
+            
             for keyword in LAB_TEST_KEYWORDS:
                 if re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
                     matched_keywords.append(keyword)
+            
             if matched_keywords:
+                # To avoid overlap, check if it's *also* a project announcement.
+                # If it has project keywords, we'll let the project detector handle it.
                 is_project = False
                 for proj_keyword in PROJECT_KEYWORDS:
-                     if re.search(r'\b' + re.escape(proj_keyword) + r'\b', text, re.IGNORECASE):
-                        is_project = True
-                        break
+                        if re.search(r'\b' + re.escape(proj_keyword) + r'\b', text, re.IGNORECASE):
+                            is_project = True
+                            break
+                
+                # Only add if it's NOT primarily a project announcement
                 if not is_project:
                     lab_test_announcements.append((ann, list(set(matched_keywords))))
+        
         return lab_test_announcements
 
+    # --- EDITED: Project ideas prompt (minor tweak) ---
     def generate_tailored_project_ideas(self, course_name: str, announcement_text: str, keywords: List[str]) -> str:
         """
         Generate project ideas tailored to the specific announcement requirements.
         """
         prompt = f"""
 You are an expert educational advisor analyzing a project announcement and generating tailored project ideas.
+
 Course: {course_name}
 Project Announcement (Full Text):
 {announcement_text}
+
 Detected Keywords: {', '.join(keywords)}
+
 Your task:
+Be detailed but concise. Use bullet points heavily.
+
 1. CAREFULLY READ and ANALYZE the announcement to understand:
-   - Specific requirements and constraints, Topics or domains mentioned, Technologies or tools specified
-   - Learning objectives, Deliverables expected, Any deadlines or milestones
-   - Team size or collaboration requirements, Evaluation criteria
+   - Specific requirements and constraints
+   - Topics or domains mentioned
+   - Technologies or tools specified
+   - Learning objectives
+   - Deliverables expected
+   - Any deadlines or milestones
+   - Team size or collaboration requirements
+   - Evaluation criteria
+
 2. Generate 5-7 TAILORED PROJECT IDEAS that:
-   - DIRECTLY match the announcement specifications, Address the stated requirements
-   - Are feasible within the given constraints, Align with the course subject and level
+   - DIRECTLY match the announcement specifications
+   - Address the stated requirements
+   - Are feasible within the given constraints
+   - Align with the course subject and level
    - Incorporate mentioned technologies/tools
+
 3. For EACH project idea provide:
    - **Project Title**: Clear, descriptive name
    - **Description**: 2-3 sentences explaining the project
@@ -288,70 +320,114 @@ Your task:
    - **Implementation Steps**: 4-6 high-level steps
    - **Expected Outcomes**: What students will learn/achieve
    - **Complexity Level**: Beginner/Intermediate/Advanced
+
 4. RESOURCES & REFERENCES:
    - Provide 5-8 specific resources for EACH major technology/tool mentioned
    - Include actual GitHub repository search terms (e.g., "search GitHub for: 'student management system python django'")
    - List relevant tutorial websites with search queries
-   - Suggest YouTube channels or specific video searches, Recommend documentation links (provide exact URLs where possible)
-   - Mention similar projects on platforms like: GitHub (provide search terms), Kaggle (for data science projects), CodePen/JSFiddle (for web projects)
+   - Suggest YouTube channels or specific video searches
+   - Recommend documentation links (provide exact URLs where possible)
+   - Mention similar projects on platforms like:
+    * GitHub (provide search terms)
+    * Kaggle (for data science projects)
+    * CodePen/JSFiddle (for web projects)
+    * Instructables (for hardware projects)
+
 5. EXAMPLE PROJECT LINKS & SEARCH STRATEGIES:
    - Provide specific GitHub search queries that will find similar completed projects
    - Format: "GitHub Search: [exact search term]"
    - Example: "GitHub Search: 'e-commerce website react node mongodb'"
+   - Include alternative search terms for different platforms
+
 Format your response clearly with:
-- Main headers (##), Subheaders (###), Bullet points for lists, Code blocks for search terms or commands, Bold for emphasis
+- Main headers (##)
+- Subheaders (###)
+- Bullet points for lists
+- Code blocks for search terms or commands
+- Bold for emphasis
+
 Be SPECIFIC, PRACTICAL, and ensure all ideas are directly relevant to the announcement content.
 """
         
-        # --- MODIFIED ---
-        with self.console.status("\n💡 [bold magenta]Generating tailored project ideas...[/bold magenta]", spinner="line"):
-            try:
-                response = self.gemini_model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:
-                return f"⚠️ Error generating project ideas: {str(e)}"
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            return f"⚠️ Error generating project ideas: {str(e)}"
 
+    # --- EDITED: Practice questions prompt (minor tweak) ---
     def generate_practice_questions(self, course_name: str, announcement_text: str, keywords: List[str]) -> str:
         """
         Generate practice lab test questions based on the announcement.
         """
         prompt = f"""
 You are an expert Computer Science professor creating a practice test.
+
 Course: {course_name}
 Announcement (Full Text):
 {announcement_text}
+
 Detected Keywords: {', '.join(keywords)}
+
 Your task:
+Be concise and clear.
+
 1. CAREFULLY READ and ANALYZE the announcement to identify:
    - The key topics or concepts to be tested (e.g., "Data Structures," "Algorithms," "Database Queries," "Python Basics").
    - The format of the test (e.g., coding questions, viva, multiple choice).
    - Any specific technologies or languages mentioned.
+
 2. Generate 5-7 TAILORED PRACTICE QUESTIONS that:
    - DIRECTLY relate to the topics in the announcement.
    - Are at an appropriate difficulty level for a university course.
    - Mimic the likely format of the test (focus on coding problems if it's a "lab test").
+
 3. For EACH practice question, provide:
    - **Question Title/Topic**: (e.g., "Array Manipulation," "SQL Join," "Binary Tree Traversal")
    - **Problem Statement**: A clear, concise problem.
    - **Example Input/Output**: (if applicable)
    - **Key Concepts to Apply**: What the student needs to know to solve it.
    - **Hint**: (Optional) A small hint to guide the student.
+
 4. Provide a "Study Guide & Resources" section:
    - List the 3-5 most important topics to review.
    - Provide 5-8 specific resources (documentation links, tutorials, YouTube video searches) to help students prepare for these topics.
    - Format: "Search YouTube for: 'Data Structures in Python full course'"
    - Format: "Read documentation: 'Python 'list' methods'"
+
 Format your response clearly using Markdown (headers, subheaders, bullet points, and code blocks for code).
 Be SPECIFIC, PRACTICAL, and ensure all questions are directly relevant to the announcement content.
 """
         
-        # --- MODIFIED ---
-        with self.console.status("\n💡 [bold cyan]Generating practice questions...[/bold cyan]", spinner="line"):
-            try:
-                response = self.gemini_model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:
-                return f"⚠️ Error generating practice questions: {str(e)}"
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            return f"⚠️ Error generating practice questions: {str(e)}"
+
+
+# ---------------------- NEW: Helper Function for Saving ----------------------
+
+def _ask_to_save_md(content: str, course_name: str, file_type: str, console: Console):
+    """Asks the user if they want to save content to a .md file."""
+    
+    # Sanitize course name for a safe filename
+    safe_course_name = re.sub(r'[^\w\-_\. ]', '_', course_name).replace(' ', '_')
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M')
+    default_filename = f"{file_type}-{safe_course_name}-{timestamp}.md"
+
+    if typer.confirm(f"\n💾 Do you want to save these {file_type.replace('-', ' ')}?"):
+        filename = typer.prompt(
+            "Enter filename", 
+            default=default_filename
+        )
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(content)
+            console.print(f"[green]✓ Successfully saved to [bold]{filename}[/bold][/green]")
+        except Exception as e:
+            console.print(f"[red]⚠️  Error saving file: {e}[/red]")
+        print() # Add a newline for spacing
 
 
 # ---------------------- Typer Commands ----------------------
@@ -362,24 +438,14 @@ def list_courses(
     token: str = typer.Option("token.pickle", help="Path to saved token file"),
 ):
     """List all available Google Classroom courses."""
-    # --- MODIFIED ---
-    monitor = ClassroomMonitor(console=console, credentials_file=credentials, token_file=token)
+    console.print("📚 [bold]Fetching your courses...[/bold]\n")
+    monitor = ClassroomMonitor(credentials_file=credentials, token_file=token)
     courses = monitor.get_courses()
-    
     if not courses:
-        console.print("[red]No active courses found.[/red]")
+        console.print("No active courses found.")
         raise typer.Exit()
-
-    # --- NEW: Use rich.table.Table ---
-    table = Table(title="📚 Your Active Google Classroom Courses", border_style="blue")
-    table.add_column("Course Name", style="green", no_wrap=True)
-    table.add_column("Course ID", style="cyan", no_wrap=True)
-
     for c in courses:
-        table.add_row(c['name'], c['id'])
-    
-    console.print(table)
-    # --- END NEW ---
+        console.print(f"• [green]{c['name']}[/green] (ID: {c['id']})")
 
 
 # --- Command from Summarizer Script ---
@@ -395,15 +461,14 @@ def summarize(
 ):
     """Fetch and summarize all announcements for each course."""
     console.print("🚀 [bold]Initializing Google Classroom Summarizer...[/bold]")
-    # --- MODIFIED ---
-    monitor = ClassroomMonitor(console=console, credentials_file=credentials, token_file=token)
+    monitor = ClassroomMonitor(credentials_file=credentials, token_file=token)
     print()
 
     # Determine which courses to process
     if course_id:
+        # Try to get course name for better display
         try:
-            with console.status(f"Fetching course info for {course_id}...", spinner="dots"):
-                course_info = monitor.service.courses().get(id=course_id).execute()
+            course_info = monitor.service.courses().get(id=course_id).execute()
             course_name = course_info.get('name', f'Course {course_id}')
         except HttpError:
             course_name = f'Course {course_id}'
@@ -430,24 +495,14 @@ def summarize(
             continue
 
         total += len(anns)
-        
-        # --- NEW: Format announcement list better ---
-        ann_list_text = Text()
+        console.print(f"📢 Found [green]{len(anns)}[/green] announcement(s):\n")
         for i, ann in enumerate(anns, start=1):
             timestamp = monitor._parse_timestamp(ann.get('updateTime')).strftime("%Y-%m-%d %H:%M")
             text = ann.get('text', 'No content').strip().split('\n')[0] # Show first line
-            ann_list_text.append(f"{i}. ", style="dim")
-            ann_list_text.append(f"[{timestamp}] ", style="yellow")
-            ann_list_text.append(f"{text[:100]}...\n")
-            
-        console.print(Panel(
-            ann_list_text,
-            title=f"📢 Found [green]{len(anns)}[/green] Announcement(s)",
-            border_style="dim"
-        ))
-        # --- END NEW ---
+            console.print(f"{i}. [{timestamp}] {text[:100]}...") # Truncate long lines
 
         if not no_summary:
+            console.print("\n🤖 [cyan]Generating overall course summary...[/cyan]\n")
             summary = monitor.summarize_course_announcements(course['name'], anns)
             console.print(Panel(
                 summary,
@@ -455,6 +510,10 @@ def summarize(
                 border_style="blue",
                 padding=(1, 2)
             ))
+            # --- NEW ---
+            # Ask to save the summary
+            _ask_to_save_md(summary, course['name'], "summary", console)
+            
         print()
 
     console.rule("[bold]Summary Complete[/bold]")
@@ -476,15 +535,14 @@ def detect(
     Detect project/lab test announcements and generate tailored ideas/questions.
     """
     console.print("🚀 [bold]Initializing Google Classroom Project Detector...[/bold]")
-    # --- MODIFIED ---
-    monitor = ClassroomMonitor(console=console, credentials_file=credentials, token_file=token)
+    monitor = ClassroomMonitor(credentials_file=credentials, token_file=token)
     print()
 
     # Determine which courses to process
     if course_id:
+        # Try to get course name for better display
         try:
-            with console.status(f"Fetching course info for {course_id}...", spinner="dots"):
-                course_info = monitor.service.courses().get(id=course_id).execute()
+            course_info = monitor.service.courses().get(id=course_id).execute()
             course_name = course_info.get('name', f'Course {course_id}')
         except HttpError:
             course_name = f'Course {course_id}'
@@ -548,7 +606,8 @@ def detect(
                     console.print()
                     continue
                 
-                # --- MODIFIED --- (Spinner is inside the function)
+                console.print("\n💡 [bold magenta]Analyzing announcement and generating tailored project ideas...[/bold magenta]\n")
+                
                 project_ideas = monitor.generate_tailored_project_ideas(
                     course['name'], 
                     text, 
@@ -561,6 +620,11 @@ def detect(
                     border_style="green",
                     padding=(1, 2)
                 ))
+                
+                # --- NEW ---
+                # Ask to save the project ideas
+                _ask_to_save_md(project_ideas, course['name'], f"project-ideas-{idx}", console)
+                
                 console.print("\n" + "="*80 + "\n")
 
         # --- Process Lab Test Announcements ---
@@ -585,7 +649,8 @@ def detect(
                     console.print()
                     continue
                     
-                # --- MODIFIED --- (Spinner is inside the function)
+                console.print("\n💡 [bold cyan]Analyzing announcement and generating practice questions...[/bold cyan]\n")
+                
                 practice_questions = monitor.generate_practice_questions(
                     course['name'], 
                     text, 
@@ -598,6 +663,11 @@ def detect(
                     border_style="blue",
                     padding=(1, 2)
                 ))
+                
+                # --- NEW ---
+                # Ask to save the practice questions
+                _ask_to_save_md(practice_questions, course['name'], f"practice-questions-{idx}", console)
+                
                 console.print("\n" + "="*80 + "\n")
 
     # Summary
@@ -623,9 +693,8 @@ def analyze(
     Analyze specific text and generate tailored project ideas OR practice questions.
     """
     console.print(f"🔍 [bold]Analyzing announcement text for: {course_name}[/bold]\n")
-    # --- MODIFIED ---
     # Authentication is needed just to set up the Gemini model
-    monitor = ClassroomMonitor(console=console, credentials_file=credentials, token_file=token)
+    monitor = ClassroomMonitor(credentials_file=credentials, token_file=token)
     
     # Detect project keywords
     project_keywords = []
@@ -656,7 +725,8 @@ def analyze(
             padding=(1, 2)
         ))
         
-        # --- MODIFIED --- (Spinner is in the function)
+        console.print("\n💡 [bold magenta]Generating tailored project ideas...[/bold magenta]\n")
+        
         project_ideas = monitor.generate_tailored_project_ideas(
             course_name, 
             announcement_text, 
@@ -669,6 +739,10 @@ def analyze(
             border_style="green",
             padding=(1, 2)
         ))
+        
+        # --- NEW ---
+        # Ask to save the project ideas
+        _ask_to_save_md(project_ideas, course_name, "project-ideas-manual", console)
     
     # Else If: If no project keywords, but lab test keywords are present, run lab test analysis
     elif lab_test_keywords:
@@ -680,7 +754,8 @@ def analyze(
             padding=(1, 2)
         ))
         
-        # --- MODIFIED --- (Spinner is in the function)
+        console.print("\n💡 [bold cyan]Analyzing announcement and generating practice questions...[/bold cyan]\n")
+        
         practice_questions = monitor.generate_practice_questions(
             course_name, 
             announcement_text, 
@@ -693,6 +768,10 @@ def analyze(
             border_style="blue",
             padding=(1, 2)
         ))
+        
+        # --- NEW ---
+        # Ask to save the practice questions
+        _ask_to_save_md(practice_questions, course_name, "practice-questions-manual", console)
         
     console.print()
 
