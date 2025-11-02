@@ -6,7 +6,7 @@ Google Classroom Study Buddy
 This CLI tool connects to the Google Classroom and Drive APIs to:
 1. Detect new lecture materials (PDFs, Google Docs).
 2. Extract the text content from those materials.
-3. Use the Gemini API to generate study aids (Video Overviews, Mindmaps, Flashcards, Quizzes).
+3. Use the Gemini API to generate study aids (Audio Summaries, Flashcards, Quizzes).
 4. Upload the generated study aids directly to your Google Drive.
 
 Setup:
@@ -15,7 +15,7 @@ Setup:
 2. Download OAuth credentials.json.
 3. Install dependencies:
    pip install google-auth google-auth-oauthlib google-api-python-client \
-               google-generativeai python-dotenv typer rich pdfplumber
+               google-generativeai python-dotenv typer rich pdfplumber gTTS
 4. Create a .env file with:
    GEMINI_API_KEY=your_api_key_here
 5. Run for the first time to authenticate:
@@ -48,6 +48,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 import google.generativeai as genai
 from dotenv import load_dotenv
 import pdfplumber
+from gtts import gTTS # <-- NEW IMPORT
 
 # ---------------------- Setup ----------------------
 app = typer.Typer(help="A CLI Study Buddy for Google Classroom, powered by Gemini AI.")
@@ -60,7 +61,7 @@ SCOPES = [
     'https://www.googleapis.com/auth/classroom.courses.readonly',
     'https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly',
     'https://www.googleapis.com/auth/drive.readonly', # To read/download lecture files
-    'https://www.googleapis.com/auth/drive.file'    # To upload generated study aids
+    'https://www.googleapis.com/auth/drive.file'     # To upload generated study aids
 ]
 
 # ---------------------- Core Class ----------------------
@@ -231,7 +232,7 @@ class StudyBuddyCLI:
                         full_text = "\n".join(
                             page.extract_text() for page in pdf.pages if page.extract_text()
                         )
-                    return full_text
+                        return full_text
                 except Exception as e:
                     console.print(f"  [red]Error reading PDF content: {e}[/red]")
                     return None
@@ -264,6 +265,29 @@ class StudyBuddyCLI:
             console.print(f"[red]Error uploading {filename} to Drive: {e}[/red]")
             return None
 
+    # --- NEW FUNCTION ---
+    def _upload_audio_to_drive(self, audio_bytes_io: io.BytesIO, filename: str) -> Optional[str]:
+        """
+        Uploads generated audio bytes to Google Drive.
+        """
+        file_metadata = {'name': filename}
+        audio_bytes_io.seek(0) # Rewind the in-memory file
+        media = MediaIoBaseUpload(
+            audio_bytes_io,
+            mimetype='audio/mpeg',
+            resumable=True
+        )
+        try:
+            file = self.drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id, webViewLink'
+            ).execute()
+            return file.get('webViewLink')
+        except HttpError as e:
+            console.print(f"[red]Error uploading {filename} to Drive: {e}[/red]")
+            return None
+
     # --- Gemini Generation Functions ---
 
     def _run_gemini_prompt(self, prompt: str, lecture_text: str) -> str:
@@ -276,30 +300,20 @@ class StudyBuddyCLI:
             console.print(f"[red]Error during Gemini generation: {e}[/red]")
             return "Error: Could not generate content."
 
-    def generate_video_overview(self, text: str) -> str:
+    # --- NEW FUNCTION ---
+    def generate_audio_narration(self, text: str) -> str:
         prompt = """
-        You are a scriptwriter. Based on the provided lecture text, write a
-        concise 2-3 minute video script (narration only).
-        This script should serve as a high-level overview of the main topics.
-        Start with a hook, cover 3-5 key points, and end with a brief conclusion.
-        Format the output as simple text.
-        """
-        return self._run_gemini_prompt(prompt, text)
-
-    def generate_mindmap(self, text: str) -> str:
-        prompt = """
-        You are an expert data visualizer. Based on the provided lecture text,
-        generate a mindmap in hierarchical Markdown format.
-        Use nested bullet points (-, *, +) to show relationships.
-        Identify the central topic and branch out to main concepts and sub-topics.
+        You are a narrator. Based on the provided lecture text, write a
+        concise 2-3 minute audio script (narration only).
+        This script will be used for a text-to-speech audio summary.
+        Focus on the main topics, key definitions, and conclusions.
+        Be clear, concise, and speak directly to the listener.
+        
+        IMPORTANT: Do NOT include any visual cues, headings, titles, or Markdown formatting.
+        Output only the plain text of the narration.
         
         Example:
-        - Main Topic
-          - Sub-Topic 1
-            * Detail A
-            * Detail B
-          - Sub-Topic 2
-            * Detail C
+        Hello, and welcome to this lecture summary. Today we're covering three main points. First, what is...
         """
         return self._run_gemini_prompt(prompt, text)
 
@@ -435,24 +449,29 @@ def detect(
 
             base_filename = f"{re.sub(r'[^\w\-_\. ]', '', title).replace(' ', '_')}"
             
-            # Video Overview
-            if typer.confirm("  1. Generate a Video Overview script?"):
-                with Status("[bold magenta]Generating video overview...[/bold magenta]", console=console):
-                    content = cli.generate_video_overview(full_lecture_text)
-                    filename = f"Overview-{base_filename}.md"
-                    link = cli._upload_to_drive(content, filename)
-                console.print(f"  [green]✓ Video Overview generated![/green] [dim]({link})[/dim]")
+            # --- MODIFIED BLOCK ---
+            # Audio Summary (MP3)
+            if typer.confirm("  1. Generate an Audio Summary (MP3)?"):
+                with Status("[bold magenta]Generating audio summary...[/bold magenta]", console=console):
+                    try:
+                        # 1. Generate text narration
+                        narration_text = cli.generate_audio_narration(full_lecture_text)
+                        
+                        # 2. Generate MP3 in memory
+                        audio_fp = io.BytesIO()
+                        tts = gTTS(text=narration_text, lang='en')
+                        tts.write_to_fp(audio_fp)
+                        
+                        # 3. Upload the in-memory MP3 file
+                        filename = f"Summary-{base_filename}.mp3"
+                        link = cli._upload_audio_to_drive(audio_fp, filename)
+                        
+                        console.print(f"  [green]✓ Audio Summary generated![/green] [dim]({link})[/dim]")
+                    except Exception as e:
+                        console.print(f"  [red]Error generating audio: {e}[/red]")
                 
-            # Mindmap
-            if typer.confirm("  2. Generate a Mindmap?"):
-                with Status("[bold magenta]Generating mindmap...[/bold magenta]", console=console):
-                    content = cli.generate_mindmap(full_lecture_text)
-                    filename = f"Mindmap-{base_filename}.md"
-                    link = cli._upload_to_drive(content, filename)
-                console.print(f"  [green]✓ Mindmap generated![/green] [dim]({link})[/dim]")
-
             # Flashcards
-            if typer.confirm("  3. Generate Flashcards?"):
+            if typer.confirm("  2. Generate Flashcards?"):
                 with Status("[bold magenta]Generating flashcards...[/bold magenta]", console=console):
                     content = cli.generate_flashcards(full_lecture_text)
                     filename = f"Flashcards-{base_filename}.csv"
@@ -460,8 +479,8 @@ def detect(
                 console.print(f"  [green]✓ Flashcards generated![/green] [dim]({link})[/dim]")
 
             # Quiz
-            if typer.confirm("  4. Generate a Quiz?"):
-                with Status("[bold magenta]Generating quiz...[/bold magenta]", console=console):
+            if typer.confirm("  3. Generate a Quiz?"):
+                with Status("[bold magenta]Generating quiz...[/I-will-not-generate-that-content]", console=console):
                     content = cli.generate_quiz(full_lecture_text)
                     filename = f"Quiz-{base_filename}.md"
                     link = cli._upload_to_drive(content, filename)
