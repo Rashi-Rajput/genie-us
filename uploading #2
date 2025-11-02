@@ -12,8 +12,8 @@ This CLI tool connects to the Google Classroom and Drive APIs to:
 NEW IN THIS VERSION:
 - Added `solve-assignments` command.
 - Detects new *assignments* (not just materials).
-- Generates a solution (Code + Expected Output) in a Google Doc.
-- Saves to Drive as "Solution_{Assignment_Name}".
+- Generates a solution (Code + Expected Output) as a Markdown file.
+- Saves solution locally as "Solution_{Assignment_Name}.md".
 
 Setup:
 -------
@@ -334,7 +334,7 @@ class StudyBuddyCLI:
             console.print(f"[red]Error uploading {filename} to Drive: {e}[/red]")
             return None
 
-    # --- NEW FUNCTION ---
+    # --- FUNCTION NO LONGER USED BY solve_assignments ---
     def _upload_text_as_gdoc(self, content: str, filename: str) -> Optional[str]:
         """
         Uploads text content as a new Google Doc, converting from Markdown.
@@ -642,7 +642,7 @@ def solve_assignments(
             course_info = cli.classroom_service.courses().get(id=course_id).execute()
             course_name = course_info.get('name', f'Course {course_id}')
             courses = [{'id': course_id, 'name': course_name}]
-        except HttpError:
+        except HttpError as e:
             console.print(f"[red]Error: Could not find course with ID {course_id}[/red]")
             raise typer.Exit()
     elif all_courses:
@@ -705,16 +705,18 @@ def solve_assignments(
                     # 1. Generate solution text
                     solution_content = cli.generate_assignment_solution(full_assignment_text)
                     
-                    # 2. Upload as a new Google Doc
-                    link = cli._upload_text_as_gdoc(solution_content, base_filename)
+                    # --- MODIFIED BLOCK: Save to local file instead of GDrive ---
+                    local_filename = f"{base_filename}.md"
+                    with open(local_filename, 'w', encoding='utf-8') as f:
+                        f.write(solution_content)
                     
-                    if link:
-                        console.print(f"  [green]✓ Solution Document generated![/green] [dim]({link})[/dim]")
+                    if os.path.exists(local_filename):
+                        console.print(f"  [green]✓ Solution file saved locally![/green] [dim]({local_filename})[/dim]")
                     else:
-                        console.print(f"  [red]Error: Could not upload solution document.[/red]")
+                        console.print(f"  [red]Error: Could not save solution file.[/red]")
                         
                 except Exception as e:
-                    console.print(f"  [red]Error generating solution: {e}[/red]")
+                    console.print(f"  [red]Error generating or saving solution: {e}[/red]")
 
             console.print(f"\n[bold green]✅ Done processing '{title}'![/bold green]")
             
