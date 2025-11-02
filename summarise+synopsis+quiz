@@ -63,8 +63,8 @@ SCOPES = [
 # Project-related keywords to detect
 PROJECT_KEYWORDS = [
     'synopsis', 'project', 'pbl', 'problem-based learning', 'problem based learning',
-    'assignment', 'capstone', 'thesis', 'research', 'presentation', 'proposal',
-    'implementation', 'development', 'design', 'prototype', 'deliverable',
+    'capstone', 'thesis', 'research', 'presentation', 'proposal', 'development', 'design',
+    'prototype', 'deliverable',
     'milestone', 'case study', 'report', 'documentation', 'mini project',
     'major project', 'final year project', 'term project', 'semester project'
 ]
@@ -120,7 +120,7 @@ class ClassroomMonitor:
             raise ValueError("Missing GEMINI_API_KEY in environment variables (.env file).")
         genai.configure(api_key=api_key)
         # Using the gemini-1.5-flash model from the detector script
-        self.gemini_model = genai.GenerativeModel('models/gemini-1.5-flash')
+        self.gemini_model = genai.GenerativeModel('models/gemini-2.5-flash')
         console.print("[green]✓ Gemini AI configured![/green]")
 
     def get_courses(self):
